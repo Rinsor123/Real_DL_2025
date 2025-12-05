@@ -1222,10 +1222,10 @@ def train_single_config(
 
         for batch in train_loader:
             seq_inputs = batch["sequence_inputs"].to(DEVICE)
-            labels_full = batch["labels"].to(DEVICE)  # (B, T, num_labels)
-            eligibility_full = batch["eligibility"].to(DEVICE)  # (B, T, num_labels)
+            labels_full = batch["labels"].to(DEVICE)  #(B, T, num_labels)
+            eligibility_full = batch["eligibility"].to(DEVICE)  #(B, T, num_labels)
             mask = batch["mask"].to(DEVICE)
-            valid_lengths = batch["valid_lengths"].to(DEVICE)  # (B,)
+            valid_lengths = batch["valid_lengths"].to(DEVICE)  #(B,)
 
             spatial_data_batch = {
                 "player_trails": tuple(t.to(DEVICE) for t in batch["spatial_data"]["player_trails"]),
@@ -1239,10 +1239,10 @@ def train_single_config(
             logits = model(seq_inputs, spatial_data_batch, src_key_padding_mask=(mask == 0), valid_lengths=valid_lengths)
 
             B = seq_inputs.shape[0]
-            last_indices = (valid_lengths - 1).clamp(min=0)  # (B,)
+            last_indices = (valid_lengths - 1).clamp(min=0)  #(B,)
             batch_indices = torch.arange(B, device=DEVICE)
-            labels = labels_full[batch_indices, last_indices]  # (B, num_labels)
-            eligibility = eligibility_full[batch_indices, last_indices]  # (B, num_labels)
+            labels = labels_full[batch_indices, last_indices]  #(B, num_labels)
+            eligibility = eligibility_full[batch_indices, last_indices]  #(B, num_labels)
 
             valid_mask = eligibility
 
@@ -1472,9 +1472,7 @@ def run_random_search(
 
     return results_sorted
 
-
 # optuna search
-
 def create_optuna_study(study_name: str, storage_path: Path | None = None) -> "optuna.Study":
     """Create or load an Optuna study with SQLite storage for offline use."""
     if not OPTUNA_AVAILABLE:
@@ -1491,12 +1489,10 @@ def create_optuna_study(study_name: str, storage_path: Path | None = None) -> "o
         study_name=study_name,
         storage=storage_url,
         sampler=sampler,
-        direction="maximize",  # Maximize PR-AUC
-        load_if_exists=True,  # Resume if study already exists
+        direction="maximize",  #maximize PR-AUC
+        load_if_exists=True,  
     )
-
     return study
-
 
 def optuna_objective(
     trial: "optuna.Trial",
@@ -1511,7 +1507,9 @@ def optuna_objective(
     wandb_group: str | None = None,
     shuffle: bool = True,
 ) -> float:
-    """Optuna objective function for a single trial."""
+    """
+    optuna objective function for a single trial
+    """
     wandb_run = None
     try:
         config = sample_optuna_config(trial, max_epochs=max_epochs)
@@ -1656,7 +1654,6 @@ def optuna_objective(
             wandb_run.finish(exit_code=1)
         return float("-inf")
 
-
 def run_optuna_search(
     num_trials: int,
     train_df: pd.DataFrame,
@@ -1674,7 +1671,9 @@ def run_optuna_search(
     trial_id: int | None = None,
     shuffle: bool = True,
 ):
-    """Run Optuna Bayesian hyperparameter search."""
+    """
+    run Optuna Bayesian hyperparameter search
+    """
     if not OPTUNA_AVAILABLE:
         raise ImportError(
             "Optuna is required for Bayesian hyperparameter search. "
@@ -1710,7 +1709,7 @@ def run_optuna_search(
             elif existing_trial.state == optuna.trial.TrialState.RUNNING:
                 _log(f"Trial {trial_id} is currently running by another job. Waiting...")
                 import time
-                max_wait = 300  # Wait up to 5 minutes
+                max_wait = 300  
                 waited = 0
                 while waited < max_wait:
                     time.sleep(10)
@@ -1732,7 +1731,7 @@ def run_optuna_search(
                 else:
                     _log(f"Trial {trial_id} no longer exists in study after {waited}s.")
             else:
-                _log(f"Trial {trial_id} exists in state {existing_trial.state}. Running new trial...")
+                _log(f"Trial {trial_id} exists in state {existing_trial.state}. Running new trial")
                 study.optimize(objective, n_trials=1, show_progress_bar=False)
     else:
         _log(f"Starting Optuna Bayesian search with {num_trials} total trials (study: {study_name})")
@@ -1750,7 +1749,7 @@ def run_optuna_search(
                 _log(f"All {num_trials} trials completed! (Found {completed} completed trials)")
                 break
 
-            _log(f"Progress: {completed}/{num_trials} trials completed. Running next trial...")
+            _log(f"Progress: {completed}/{num_trials} trials completed. Running next trial")
 
             study.optimize(
                 objective,
@@ -1821,7 +1820,7 @@ def run_optuna_search(
                 if eval_done_file.exists():
                     _log(f"\nBest model evaluation already completed by another job. Skipping.")
                 else:
-                    _log("\nAcquired lock for best model evaluation. Evaluating best config on test set...")
+                    _log("\nAcquired lock for best model evaluation. Evaluating best config on test set")
                     result = train_single_config(
                         run_id=study.best_trial.number,
                         config=best_config,
@@ -1834,7 +1833,7 @@ def run_optuna_search(
                         eligibility_cols=eligibility_cols,
                         pos_weight=pos_weight,
                         wandb_group=wandb_group + "-final",
-                        shuffle=False,  # Disable shuffling for reproducibility
+                        shuffle=False,  
                     )
                     if result:
                         _log(f"Test macro PR-AUC: {result['test_macro_pr_auc']:.4f}")
@@ -1854,9 +1853,7 @@ def run_optuna_search(
 
     return study
 
-
 # main entry point
-
 def main():
     parser_prelim = argparse.ArgumentParser(add_help=False)
     parser_prelim.add_argument("--mode", type=str, default="train",
@@ -1865,7 +1862,7 @@ def main():
 
     if args_prelim.mode in ["optuna", "search"]:
         jitter = random.uniform(0, 15)
-        _log(f"Startup jitter: sleeping {jitter:.2f} seconds to prevent thundering herd...")
+        _log(f"Startup jitter: sleeping {jitter:.2f} seconds to prevent thundering herd")
         time.sleep(jitter)
 
     parser = argparse.ArgumentParser(description="Hybrid Transformer-CNN Model Training")
@@ -1918,7 +1915,7 @@ def main():
         spatial_data = torch.load(SPATIAL_DATA_PACKED_PATH, weights_only=False)
         _log(f"Loaded packed format with {spatial_data.get('num_samples', 'unknown')} samples")
     elif SPATIAL_DATA_PATH.exists():
-        _log(f"Loading raw spatial data from {SPATIAL_DATA_PATH}...")
+        _log(f"Loading raw spatial data from {SPATIAL_DATA_PATH}")
         _log("Note: Consider converting to packed format using pack_spatial.py for better memory efficiency")
         spatial_data = torch.load(SPATIAL_DATA_PATH, weights_only=False)
     else:
@@ -1967,7 +1964,7 @@ def main():
             if len(target_match_ids) >= args.data_limit:
                 break
 
-        target_match_ids = set(target_match_ids)  # Convert to set for fast lookup
+        target_match_ids = set(target_match_ids)  
 
         if len(target_match_ids) < args.data_limit:
             _log(f"Warning: Only found {len(target_match_ids)} unique games, requested {args.data_limit}")
@@ -1986,7 +1983,7 @@ def main():
             raise ValueError(f"No data found for the requested {args.data_limit} games")
 
         team_sequence_df = pd.concat(dfs, ignore_index=True)
-        del dfs  # Free memory
+        del dfs  
 
         _log(f"Filling NaN values from schema drift (shape before: {team_sequence_df.shape})...")
         team_sequence_df = team_sequence_df.fillna(0)
@@ -2253,10 +2250,10 @@ def main():
 
         for batch in train_loader:
             seq_inputs = batch["sequence_inputs"].to(DEVICE)
-            labels_full = batch["labels"].to(DEVICE)  # (B, T, num_labels)
-            eligibility_full = batch["eligibility"].to(DEVICE)  # (B, T, num_labels)
+            labels_full = batch["labels"].to(DEVICE)  #(B, T, num_labels)
+            eligibility_full = batch["eligibility"].to(DEVICE)  #(B, T, num_labels)
             mask = batch["mask"].to(DEVICE)
-            valid_lengths = batch["valid_lengths"].to(DEVICE)  # (B,)
+            valid_lengths = batch["valid_lengths"].to(DEVICE)  #(B,)
 
             spatial_data_batch = {
                 "player_trails": tuple(t.to(DEVICE) for t in batch["spatial_data"]["player_trails"]),
@@ -2270,10 +2267,10 @@ def main():
             logits = model(seq_inputs, spatial_data_batch, src_key_padding_mask=(mask == 0), valid_lengths=valid_lengths)
 
             B = seq_inputs.shape[0]
-            last_indices = (valid_lengths - 1).clamp(min=0)  # (B,)
+            last_indices = (valid_lengths - 1).clamp(min=0)  #(B,)
             batch_indices = torch.arange(B, device=DEVICE)
-            labels = labels_full[batch_indices, last_indices]  # (B, num_labels)
-            eligibility = eligibility_full[batch_indices, last_indices]  # (B, num_labels)
+            labels = labels_full[batch_indices, last_indices]  #(B, num_labels)
+            eligibility = eligibility_full[batch_indices, last_indices]  #(B, num_labels)
 
             valid_mask = eligibility
 
