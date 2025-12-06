@@ -1865,89 +1865,14 @@ def main():
         _log("Please run 'python preprocess_all.py' first, or convert to packed format with 'python pack_spatial.py'")
         return
 
-    is_single_file = TEAM_SEQUENCE_FEATURES_PATH.is_file() and TEAM_SEQUENCE_FEATURES_PATH.suffix == ".parquet"
-    is_directory = TEAM_SEQUENCE_FEATURES_PATH.is_dir()
+    _log("Loading sequence data from godview_cleaned.parquet...")
+    team_sequence_df = pd.read_parquet("godview_cleaned.parquet")
 
-    if not is_single_file and not is_directory:
-        _log(f"Error: Sequence data not found at {TEAM_SEQUENCE_FEATURES_PATH}")
-        _log("Expected either a single .parquet file (e.g., godview_cleaned.parquet) or a directory with partitioned parquet files.")
-        _log("Please run 'python preprocess_all.py' first or set TEAM_SEQUENCE_FEATURES_PATH environment variable.")
-        return
-
-    if args.data_limit and not is_single_file:
-        _log(f"Optimized loading: Collecting {args.data_limit} unique games from partitions...")
-        partition_files = sorted(TEAM_SEQUENCE_FEATURES_PATH.glob("part_*.parquet"))
-        if not partition_files:
-            raise FileNotFoundError(f"No partition files found in {TEAM_SEQUENCE_FEATURES_PATH}")
-
-        target_match_ids = []
-        partitions_to_load = []
-        seen_match_ids = set()
-
-        for part_file in partition_files:
-            part_match_ids = pd.read_parquet(part_file, columns=["matchId"])["matchId"].unique()
-
-            partition_needed = False
-
-            for mid in part_match_ids:
-                if mid not in seen_match_ids:
-                    target_match_ids.append(mid)
-                    seen_match_ids.add(mid)
-                    partition_needed = True
-
-                    if len(target_match_ids) >= args.data_limit:
-                        target_match_ids = target_match_ids[:args.data_limit]
-                        seen_match_ids = set(target_match_ids)
-                        break
-
-            if partition_needed:
-                partitions_to_load.append(part_file)
-
-            if len(target_match_ids) >= args.data_limit:
-                break
-
-        target_match_ids = set(target_match_ids)  
-
-        if len(target_match_ids) < args.data_limit:
-            _log(f"Warning: Only found {len(target_match_ids)} unique games, requested {args.data_limit}")
-
-        _log(f"Found {len(target_match_ids)} unique games in {len(partitions_to_load)} partition(s)")
-        _log(f"Loading partitions: {[f.name for f in partitions_to_load]}")
-
-        dfs = []
-        for part_file in partitions_to_load:
-            df_part = pd.read_parquet(part_file)
-            df_part = df_part[df_part["matchId"].isin(target_match_ids)]
-            if len(df_part) > 0:
-                dfs.append(df_part)
-
-        if not dfs:
-            raise ValueError(f"No data found for the requested {args.data_limit} games")
-
-        team_sequence_df = pd.concat(dfs, ignore_index=True)
-        del dfs  
-
-        _log(f"Filling NaN values from schema drift (shape before: {team_sequence_df.shape})...")
-        team_sequence_df = team_sequence_df.fillna(0)
-        _log(f"Shape after fillna: {team_sequence_df.shape}")
-
-        team_sequence_df = team_sequence_df[team_sequence_df["matchId"].isin(target_match_ids)]
-        _log(f"Loaded {len(team_sequence_df):,} rows for {len(team_sequence_df['matchId'].unique()):,} games")
-    elif is_single_file:
-        _log(f"Loading single parquet file from {TEAM_SEQUENCE_FEATURES_PATH}...")
-        team_sequence_df = pd.read_parquet(TEAM_SEQUENCE_FEATURES_PATH)
-
-        _log(f"Filling NaN values from schema drift (shape before: {team_sequence_df.shape})...")
-        team_sequence_df = team_sequence_df.fillna(0)
-        _log(f"Shape after fillna: {team_sequence_df.shape}")
-
-        if args.data_limit:
-            match_ids = team_sequence_df["matchId"].unique()[:args.data_limit]
-            team_sequence_df = team_sequence_df[team_sequence_df["matchId"].isin(match_ids)]
-            _log(f"Limited to {args.data_limit} games: {len(team_sequence_df):,} rows, {len(match_ids):,} unique games")
-    else:
-        _log("Loading all partitioned parquet files...")
-        team_sequence_df = pd.read_parquet(TEAM_SEQUENCE_FEATURES_PATH)
+    # Optional: Keep the data limit logic if you still want to use --data-limit
+    if args.data_limit:
+    match_ids = team_sequence_df["matchId"].unique()[:args.data_limit]
+    team_sequence_df = team_sequence_df[team_sequence_df["matchId"].isin(match_ids)]
+    _log(f"Limited to {args.data_limit} games.")    
 
         _log(f"Filling NaN values from schema drift (shape before: {team_sequence_df.shape})...")
         team_sequence_df = team_sequence_df.fillna(0)
