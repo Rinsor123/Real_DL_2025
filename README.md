@@ -1,5 +1,6 @@
 # README
-This folder contains all of th python scripts used for our projects each of these scripts have a use in the pipeline of creating the model.
+The project is inn simplified terms a model that predicts the probability for an epic monster to be slayed in the MOBA League of legends. This is achieved by creating a hybrid model architecture.<br>
+This folder contains all of the python scripts used for our projects each of these scripts have a use in the pipeline of creating the model.
 
 ### Scripts
 We have in this folder contains scripts for fouyr different stages of the pipeline.
@@ -10,7 +11,7 @@ We have in this folder contains scripts for fouyr different stages of the pipeli
 
 2. Files used for preprocessing data.
     > preprocess\_all.py<br>
-    This file preprocesses all the data. this includes feature engineering and applying labels to observations.
+    This file preprocesses all the data. This includes feature engineering and applying labels to observations.
 
 3. Files used for training baseline models.
     > xgboost\_model.py<br>
