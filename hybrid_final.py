@@ -22,33 +22,12 @@ from sklearn.metrics import average_precision_score
 from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset, DataLoader
 import gc
-
-OPTUNA_AVAILABLE = False
-try:
-    import optuna
-    from optuna.samplers import TPESampler
-    OPTUNA_AVAILABLE = True
-except ImportError:
-    pass
-
-# weights & biases
-WANDB_AVAILABLE = False
-try:
-    import wandb
-    WANDB_AVAILABLE = True
-
-_log = lambda *args, **kwargs: None
-except ImportError:
-    pass
+import optuna
+import wandb 
+from optuna.samplers import TPESampler
 
 
-def _env_flag(name: str, default: str = "1") -> bool:
-    """
-    parse environment variable as boolean flag
-    """
-    return os.getenv(name, default).lower() not in {"0", "false", "off", "no"}
-
-
+#in order to match spatial and tabular match data
 def _hash_match_id(match_id: str) -> int:
     """
     convert matchId string to int32 hash 
@@ -65,43 +44,11 @@ WANDB_MODE = os.getenv("WANDB_MODE", "offline")
 WANDB_PROJECT = os.getenv("WANDB_PROJECT", "hybrid-objective-model")
 WANDB_ENTITY = os.getenv("WANDB_ENTITY")
 
-
-def init_wandb_run(
-    name: str,
-    job_type: str,
-    config: dict | None = None,
-    tags: list[str] | None = None,
-    group: str | None = None,
-):
-    """
-    initialize a wandb run with offline mode by default
-    """
-    if not (USE_WANDB and WANDB_AVAILABLE):
-        return None
-    try:
-        return wandb.init(
-            project=WANDB_PROJECT,
-            entity=WANDB_ENTITY,
-            name=name,
-            job_type=job_type,
-            tags=tags,
-            group=group,
-            mode=WANDB_MODE,
-            config=config or {},
-            reinit=True,
-        )
-    except Exception as exc:
-        _log(f"[WARN] wandb init failed: {exc}. Continuing without logging.")
-        return None
-
 #config
 DATA_ROOT = Path(os.getenv("DATA_ROOT", "/project/project_465002423/Deep-Learning-Project-2025/combined_data"))
-SPATIAL_DATA_PATH = DATA_ROOT / "spatial_data_raw.pt"
-SPATIAL_DATA_PACKED_PATH = DATA_ROOT / "spatial_data_packed.pt"
-TEAM_SEQUENCE_FEATURES_PATH = Path(os.getenv("TEAM_SEQUENCE_FEATURES_PATH", str(DATA_ROOT / "godview_cleaned.parquet")))
-if not TEAM_SEQUENCE_FEATURES_PATH.is_absolute():
-    TEAM_SEQUENCE_FEATURES_PATH = DATA_ROOT / TEAM_SEQUENCE_FEATURES_PATH
-TEAM_SEQUENCE_METADATA_PATH = DATA_ROOT / "team_sequence_metadata.json"
+SPATIAL_PACKED_PATH = DATA_ROOT / "spatial_data_packed.pt"
+SEQ_PATH = Path(os.getenv("TEAM_SEQUENCE_FEATURES_PATH", str(DATA_ROOT / "godview_cleaned.parquet")))
+if not SEQ_PATH.is_absolute(): SEQ_PATH = DATA_ROOT / SEQ_PATH
 
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
