@@ -1,9 +1,3 @@
-"""
-Spatial-Only Model for Objective Prediction
-Uses only spatial data 
-Predicts team-specific dragon/baron kills in the next 3 minutes.
-"""
-
 import argparse
 import json
 import math
@@ -20,14 +14,7 @@ import torch.nn.functional as F
 from sklearn.metrics import average_precision_score
 from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset, DataLoader
-
-#WandB setup
-WANDB_AVAILABLE = False
-try:
-    import wandb
-    WANDB_AVAILABLE = True
-except ImportError:
-    pass
+import wandb
 
 USE_WANDB = os.getenv("USE_WANDB", "1").lower() not in {"0", "false", "off", "no"}
 WANDB_MODE = os.getenv("WANDB_MODE", "offline")
@@ -35,7 +22,7 @@ WANDB_PROJECT = os.getenv("WANDB_PROJECT", "spatial-only-model")
 WANDB_ENTITY = os.getenv("WANDB_ENTITY")
 
 def init_wandb_run(name: str, job_type: str, config: dict | None = None, tags: list[str] | None = None):
-    if not (USE_WANDB and WANDB_AVAILABLE):
+    if not USE_WANDB:
         return None
     try:
         return wandb.init(
@@ -49,13 +36,11 @@ def init_wandb_run(name: str, job_type: str, config: dict | None = None, tags: l
             reinit=True,
         )
     except Exception as exc:
-        print(f"[WARN] wandb init failed: {exc}. Continuing without logging.")
+        print(f"wandb init failed: {exc}. continuing without logging.")
         return None
-
 
 #initialize constants
 DATA_ROOT = Path(os.getenv("DATA_ROOT", "/project/project_465002423/Deep-Learning-Project-2025/combined_data"))
-SPATIAL_DATA_PATH = DATA_ROOT / "spatial_data_raw.pt"
 SPATIAL_DATA_PACKED_PATH = DATA_ROOT / "spatial_data_packed.pt"
 TEAM_SEQUENCE_FEATURES_PATH = DATA_ROOT / "team_sequence_dataset"
 TEAM_SEQUENCE_METADATA_PATH = DATA_ROOT / "team_sequence_metadata.json"
@@ -83,7 +68,6 @@ else:
 MAP_SIZE = 15000
 GRID_SIZE = 64
 
-#tower locations
 TOWER_LOCATIONS = [
     (8955, 8510), (9767, 10113), (11134, 11207), (11593, 11669),
     (13052, 12612), (12611, 13084), (5846, 6396), (5048, 4812),
@@ -98,11 +82,7 @@ TOWER_LOCATIONS = [
 OUTPUT_DIR = DATA_ROOT / "spatial_only_model"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-
-def _hash_match_id(match_id: str) -> int:
-    """
-    Convert matchId string to int32
-    """
+def _hash_match_id(match_id: str):
     h = 5381
     for char in match_id:
         h = ((h << 5) + h) + ord(char)
@@ -125,9 +105,6 @@ class TrainConfig:
     seed: int = RANDOM_SEED
 
 class SpatialInputLayer(nn.Module):
-    """
-    makes raw game state into multi-channel heatmap
-    """
     def __init__(self, grid_size=GRID_SIZE, map_size=MAP_SIZE, sigma=1.5, turret_range=1100):
         super().__init__()
         self.grid_size = grid_size
@@ -146,7 +123,7 @@ class SpatialInputLayer(nn.Module):
         range_mask = (x_coords**2 + y_coords**2 <= r**2).float()
         self.register_buffer('range_mask', range_mask)
         
-        kernel_size = int(2 * 4 * sigma + 1)
+        kernel_size = int(8 * sigma + 1)
         if kernel_size % 2 == 0:
             kernel_size += 1
         x = torch.arange(kernel_size) - kernel_size // 2
@@ -244,9 +221,6 @@ class BasicResBlock(nn.Module):
 
 
 class SpatialCNN(nn.Module):
-    """
-    ResNet-style CNN for spatial heatmap processing
-    """
     def __init__(self, base_channels=64, dropout=0.1, spatial_sigma=1.5):
         super().__init__()
         self.renderer = SpatialInputLayer(grid_size=GRID_SIZE, map_size=MAP_SIZE, sigma=spatial_sigma)
@@ -284,7 +258,6 @@ class SpatialCNN(nn.Module):
         #make spatial heatmap
         x = self.renderer(player_trails, dead_towers, kill_ctx, obj_status)
         
-        #CNN forward
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
@@ -302,9 +275,6 @@ class SpatialCNN(nn.Module):
         return x  #(B, embed_dim)
 
 class SpatialOnlyModel(nn.Module):
-    """
-    Spatial-only model (no sequence features)
-    """
     def __init__(
         self,
         cnn_channels: int = 64,
@@ -316,15 +286,13 @@ class SpatialOnlyModel(nn.Module):
     ):
         super().__init__()
         
-        #CNN branch
         self.cnn = SpatialCNN(
             base_channels=cnn_channels,
             dropout=cnn_dropout,
             spatial_sigma=spatial_sigma,
         )
         
-        #prediction heads 
-        assert num_labels == 6, "Expected 6 labels: 3 horizons × 2 objectives"
+        assert num_labels == 6, "Expected 6 labels: 3 horizons x 2 objectives"
         cnn_embed_dim = cnn_channels * 8
         
         self.shared_mlp = nn.Sequential(
@@ -359,7 +327,7 @@ class SpatialOnlyModel(nn.Module):
         logits_2min = self.head_2min(shared_features)  #(B, 2)
         logits_3min = self.head_3min(shared_features)  #(B, 2)
         
-        #Concatenate in label order: [dragon_1min, dragon_2min, dragon_3min, baron_1min, baron_2min, baron_3min]
+        #Concatenate in label order
         logits = torch.cat([
             logits_1min[:, 0:1],  #dragon_1min
             logits_2min[:, 0:1],  #dragon_2min
@@ -373,39 +341,28 @@ class SpatialOnlyModel(nn.Module):
 
 
 class SpatialOnlyDataset(Dataset):
-    """
-    dataset for spatial-only model 
-    """
     def __init__(
         self,
         sequence_df: pd.DataFrame,
-        spatial_data: List[Dict] | Dict[str, torch.Tensor],
+        spatial_data: Dict[str, torch.Tensor],
         label_cols: List[str],
         eligibility_cols: List[str] | None = None,
     ):
-        if isinstance(spatial_data, dict) and "meta" in spatial_data:
-            self.use_packed = True
-            self.packed_data = spatial_data
-            self.meta = spatial_data["meta"]
-            self.obj_status = spatial_data["obj_status"]
-            self.towers = spatial_data["towers"]
-            self.kills_val = spatial_data["kills_val"]
-            self.kills_idx = spatial_data["kills_idx"]
-            self.trails_val = spatial_data["trails_val"]
-            self.trails_idx = spatial_data["trails_idx"]
-            
-            meta_np = self.meta.numpy()
-            self.spatial_lookup = {}
-            for i in range(len(meta_np)):
-                match_hash = int(meta_np[i, 0])
-                minute = int(meta_np[i, 1])
-                self.spatial_lookup[(match_hash, minute)] = i
-        else:
-            self.use_packed = False
-            self.spatial_lookup = {}
-            for state in spatial_data:
-                key = (state["matchId"], state["minute"])
-                self.spatial_lookup[key] = state
+        self.packed_data = spatial_data
+        self.meta = spatial_data["meta"]
+        self.obj_status = spatial_data["obj_status"]
+        self.towers = spatial_data["towers"]
+        self.kills_val = spatial_data["kills_val"]
+        self.kills_idx = spatial_data["kills_idx"]
+        self.trails_val = spatial_data["trails_val"]
+        self.trails_idx = spatial_data["trails_idx"]
+        
+        meta_np = self.meta.numpy()
+        self.spatial_lookup = {}
+        for i in range(len(meta_np)):
+            match_hash = int(meta_np[i, 0])
+            minute = int(meta_np[i, 1])
+            self.spatial_lookup[(match_hash, minute)] = i
         
         #build samples from sequence_df 
         samples = []
@@ -425,11 +382,8 @@ class SpatialOnlyDataset(Dataset):
             
             #create a sample for each minute 
             for idx, minute in enumerate(minutes):
-                if self.use_packed:
-                    match_hash = _hash_match_id(match_id)
-                    spatial_key = (match_hash, int(minute))
-                else:
-                    spatial_key = (match_id, int(minute))
+                match_hash = _hash_match_id(match_id)
+                spatial_key = (match_hash, int(minute))
                 
                 if spatial_key in self.spatial_lookup:
                     samples.append({
@@ -440,7 +394,6 @@ class SpatialOnlyDataset(Dataset):
                         "eligibility": elig[idx],
                         "spatial_key": spatial_key,
                     })
-        
         self.samples = samples
 
     def __len__(self):
@@ -450,12 +403,8 @@ class SpatialOnlyDataset(Dataset):
         item = self.samples[idx]
         team_id = item["team_id"]
         
-        if self.use_packed:
-            spatial_idx = self.spatial_lookup[item["spatial_key"]]
-            spatial_dict = self._process_spatial_state_packed(spatial_idx, team_id)
-        else:
-            spatial_state = self.spatial_lookup[item["spatial_key"]]
-            spatial_dict = self._process_spatial_state(spatial_state, team_id)
+        spatial_idx = self.spatial_lookup[item["spatial_key"]]
+        spatial_dict = self._process_spatial_state_packed(spatial_idx, team_id)
         
         return {
             "labels": torch.tensor(item["labels"], dtype=torch.float32),
@@ -463,10 +412,7 @@ class SpatialOnlyDataset(Dataset):
             **spatial_dict,
         }
     
-    def _process_spatial_state_packed(self, idx: int, team_id: int) -> Dict:
-        """
-        Process spatial state from packed tensors by index
-        """
+    def _process_spatial_state_packed(self, idx: int, team_id: int):
         dead_towers = self.towers[idx].to(torch.float32)
         obj_status = self.obj_status[idx].to(torch.float32)
         
@@ -508,57 +454,6 @@ class SpatialOnlyDataset(Dataset):
             "spatial_kills": kills,
         }
     
-    def _process_spatial_state(self, state: Dict, team_id: int) -> Dict:
-        """
-        Process spatial state dict into tensors (legacy format)
-        """
-        dead_towers = torch.zeros(30, dtype=torch.float32)
-        if state.get('dead_towers'):
-            dead_towers[torch.tensor(state['dead_towers'], dtype=torch.long)] = 1.0
-        
-        obj_status = torch.tensor([
-            float(state['objectives']['dragon']),
-            float(state['objectives']['baron'])
-        ], dtype=torch.float32)
-        
-        kills_data = state.get('kills', [])
-        if not kills_data:
-            kills = torch.empty((0, 4), dtype=torch.float32)
-        else:
-            kills = torch.tensor(kills_data, dtype=torch.float32)
-        
-        p_coords_list = []
-        p_vals_list = []
-        p_channels_list = []
-        
-        trails = state.get('player_trails', {})
-        for pid_str, points in trails.items():
-            pid = int(pid_str)
-            channel = pid - 1
-            for pt in points:
-                p_coords_list.append([pt[0], pt[1]])
-                p_vals_list.append(pt[2])
-                p_channels_list.append(channel)
-        
-        if p_coords_list:
-            p_coords = torch.tensor(p_coords_list, dtype=torch.float32)
-            p_vals = torch.tensor(p_vals_list, dtype=torch.float32)
-            p_channels = torch.tensor(p_channels_list, dtype=torch.long)
-        else:
-            p_coords = torch.empty((0, 2), dtype=torch.float32)
-            p_vals = torch.empty((0,), dtype=torch.float32)
-            p_channels = torch.empty((0,), dtype=torch.long)
-        
-        return {
-            "spatial_p_coords": p_coords,
-            "spatial_p_vals": p_vals,
-            "spatial_p_channels": p_channels,
-            "spatial_dead_towers": dead_towers,
-            "spatial_obj_status": obj_status,
-            "spatial_kills": kills,
-        }
-
-
 def collate_spatial_only(batch):
     labels = torch.stack([item["labels"] for item in batch])
     eligibility = torch.stack([item["eligibility"] for item in batch])
@@ -629,28 +524,25 @@ def collate_spatial_only(batch):
         },
     }
 
-
-#Training Functions
+#training functions
 def _label_smooth(targets: torch.Tensor, smoothing: float) -> torch.Tensor:
     if smoothing <= 0:
         return targets
     return targets * (1.0 - smoothing) + 0.5 * smoothing
 
-
 def compute_loss(logits: torch.Tensor, targets: torch.Tensor, valid_mask: torch.Tensor,
-                 pos_weight: torch.Tensor, label_smoothing: float) -> torch.Tensor:
+                 pos_weight: torch.Tensor, label_smoothing: float):
     smoothed_targets = _label_smooth(targets, label_smoothing)
     logits = torch.clamp(logits, min=-100, max=100)
     loss_raw = F.binary_cross_entropy_with_logits(
         logits, smoothed_targets, reduction="none", pos_weight=pos_weight
     )
-    loss_raw = torch.where(torch.isnan(loss_raw), torch.zeros_like(loss_raw), loss_raw)
-    loss = (loss_raw * valid_mask).sum() / (valid_mask.sum() + 1e-6)
+    #loss_raw = torch.where(torch.isnan(loss_raw), torch.zeros_like(loss_raw), loss_raw)
+    loss = (loss_raw * valid_mask).sum() / (valid_mask.sum() + 1e-7)
     return loss
 
-
 def evaluate_model(model: nn.Module, loader: DataLoader, pos_weight: torch.Tensor,
-                   num_labels: int, device: torch.device, label_smoothing: float = 0.0) -> Dict:
+                   num_labels: int, device: torch.device, label_smoothing: float = 0.0):
     model.eval()
     total_loss = 0.0
     total_weight = 0.0
@@ -715,9 +607,9 @@ def evaluate_model(model: nn.Module, loader: DataLoader, pos_weight: torch.Tenso
             fn = ((preds_binary == 0) & (targets == 1)).sum()
             tn = ((preds_binary == 0) & (targets == 0)).sum()
             
-            precision = tp / (tp + fp + 1e-6)
-            recall = tp / (tp + fn + 1e-6)
-            accuracy = (tp + tn) / (tp + tn + fp + fn + 1e-6)
+            precision = tp / (tp + fp + 1e-7)
+            recall = tp / (tp + fn + 1e-7)
+            accuracy = (tp + tn) / (tp + tn + fp + fn + 1e-7)
             
             per_label_precision.append(float(precision))
             per_label_recall.append(float(recall))
@@ -769,7 +661,7 @@ def _compute_pos_weight(df: pd.DataFrame, label_col: str, eligibility_col: str |
     neg = float(((1.0 - labels) * elig).sum())
     if pos <= 0.0:
         return 1.0
-    return max(1.0, (neg + 1e-6) / (pos + 1e-6))
+    return max(1.0, (neg + 1e-8) / (pos + 1e-8))
 
 
 def train_single_config(
@@ -777,7 +669,7 @@ def train_single_config(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
     test_df: pd.DataFrame,
-    spatial_data: List[Dict] | Dict[str, torch.Tensor],
+    spatial_data: Dict[str, torch.Tensor],
     label_cols: List[str],
     eligibility_cols: List[str],
     pos_weight: torch.Tensor,
@@ -789,7 +681,7 @@ def train_single_config(
     test_ds = SpatialOnlyDataset(test_df, spatial_data, label_cols, eligibility_cols)
     
     if len(train_ds) == 0 or len(val_ds) == 0:
-        print("Not enough data for training/validation. Skipping.")
+        print("not enough data")
         return None
     
     train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, 
@@ -937,24 +829,10 @@ def main():
     parser.add_argument("--data-limit", type=int) 
     args = parser.parse_args()
     
-    print("Loading data...")
+    print("Loading data")
     
     #load spatial data
-    if SPATIAL_DATA_PACKED_PATH.exists():
-        print(f"Loading packed spatial data from {SPATIAL_DATA_PACKED_PATH}")
-        spatial_data = torch.load(SPATIAL_DATA_PACKED_PATH, weights_only=False)
-        print(f"Loaded packed format with {spatial_data.get('num_samples', 'unknown')} samples")
-    elif SPATIAL_DATA_PATH.exists():
-        print(f"Loading raw spatial data from {SPATIAL_DATA_PATH}")
-        spatial_data = torch.load(SPATIAL_DATA_PATH, weights_only=False)
-    else:
-        print(f"Error: Spatial data not found at {SPATIAL_DATA_PATH} or {SPATIAL_DATA_PACKED_PATH}")
-        return
-    
-    #load sequence data 
-    if not TEAM_SEQUENCE_FEATURES_PATH.exists() or not TEAM_SEQUENCE_FEATURES_PATH.is_dir():
-        print(f"Error: Sequence data directory not found at {TEAM_SEQUENCE_FEATURES_PATH}")
-        return
+    spatial_data = torch.load(SPATIAL_DATA_PACKED_PATH, weights_only=False)
     
     if args.data_limit:
         partition_files = sorted(TEAM_SEQUENCE_FEATURES_PATH.glob("part_*.parquet"))
@@ -990,44 +868,37 @@ def main():
             if len(df_part) > 0:
                 dfs.append(df_part)
         
-        if not dfs:
-            raise ValueError(f"No data found for the requested {args.data_limit} games")
-        
         team_sequence_df = pd.concat(dfs, ignore_index=True)
         team_sequence_df = team_sequence_df.fillna(0)
         team_sequence_df = team_sequence_df[team_sequence_df["matchId"].isin(target_match_ids)]
         
         #filter spatial data if packed 
-        if isinstance(spatial_data, dict) and "meta" in spatial_data:
-            def normalize_match_id(mid):
-                mid_str = str(mid)
-                if mid_str.endswith('.0'):
-                    mid_str = mid_str[:-2]
-                return mid_str
-            
-            match_hashes = {_hash_match_id(normalize_match_id(mid)) for mid in target_match_ids}
-            meta_np = spatial_data["meta"].numpy()
-            valid_indices = []
-            for i in range(len(meta_np)):
-                if int(meta_np[i, 0]) in match_hashes:
-                    valid_indices.append(i)
-            
-            if len(valid_indices) < len(meta_np):
-                print(f"Filtering packed data to {len(valid_indices):,} samples...")
-                valid_indices = np.array(valid_indices)
-                spatial_data = {
-                    "meta": spatial_data["meta"][valid_indices],
-                    "obj_status": spatial_data["obj_status"][valid_indices],
-                    "towers": spatial_data["towers"][valid_indices],
-                    "kills_val": spatial_data["kills_val"],
-                    "kills_idx": spatial_data["kills_idx"][valid_indices],
-                    "trails_val": spatial_data["trails_val"],
-                    "trails_idx": spatial_data["trails_idx"][valid_indices],
-                    "num_samples": len(valid_indices),
-                }
-    else:
-        team_sequence_df = pd.read_parquet(TEAM_SEQUENCE_FEATURES_PATH)
-        team_sequence_df = team_sequence_df.fillna(0)
+        def normalize_match_id(mid):
+            mid_str = str(mid)
+            if mid_str.endswith('.0'):
+                mid_str = mid_str[:-2]
+            return mid_str
+        
+        match_hashes = {_hash_match_id(normalize_match_id(mid)) for mid in target_match_ids}
+        meta_np = spatial_data["meta"].numpy()
+        valid_indices = []
+        for i in range(len(meta_np)):
+            if int(meta_np[i, 0]) in match_hashes:
+                valid_indices.append(i)
+        
+        if len(valid_indices) < len(meta_np):
+            print(f"Filtering packed data to {len(valid_indices):,} samples...")
+            valid_indices = np.array(valid_indices)
+            spatial_data = {
+                "meta": spatial_data["meta"][valid_indices],
+                "obj_status": spatial_data["obj_status"][valid_indices],
+                "towers": spatial_data["towers"][valid_indices],
+                "kills_val": spatial_data["kills_val"],
+                "kills_idx": spatial_data["kills_idx"][valid_indices],
+                "trails_val": spatial_data["trails_val"],
+                "trails_idx": spatial_data["trails_idx"][valid_indices],
+                "num_samples": len(valid_indices),
+            }
     
     with open(TEAM_SEQUENCE_METADATA_PATH, "r") as meta_file:
         team_sequence_meta = json.load(meta_file)
@@ -1082,13 +953,10 @@ def main():
         config, train_df, val_df, test_df,
         spatial_data, team_label_cols, team_eligibility_cols, pos_weight
     )
-    
     if result:
         print(f"\nTraining complete!")
         print(f"Val PR-AUC: {result['val_macro_pr_auc']:.4f}")
         print(f"Test PR-AUC: {result['test_macro_pr_auc']:.4f}")
 
-
 if __name__ == "__main__":
     main()
-
