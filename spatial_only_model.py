@@ -42,7 +42,9 @@ def init_wandb_run(name: str, job_type: str, config: dict | None = None, tags: l
 #initialize constants
 DATA_ROOT = Path(os.getenv("DATA_ROOT", "/project/project_465002423/Deep-Learning-Project-2025/combined_data"))
 SPATIAL_DATA_PACKED_PATH = DATA_ROOT / "spatial_data_packed.pt"
-TEAM_SEQUENCE_FEATURES_PATH = DATA_ROOT / "team_sequence_dataset"
+TEAM_SEQUENCE_FEATURES_PATH = Path(os.getenv("TEAM_SEQUENCE_FEATURES_PATH", str(DATA_ROOT / "team_sequence_dataset")))
+if not TEAM_SEQUENCE_FEATURES_PATH.is_absolute():
+    TEAM_SEQUENCE_FEATURES_PATH = DATA_ROOT / TEAM_SEQUENCE_FEATURES_PATH
 TEAM_SEQUENCE_METADATA_PATH = DATA_ROOT / "team_sequence_metadata.json"
 
 if torch.cuda.is_available():
@@ -834,10 +836,11 @@ def main():
     #load spatial data
     spatial_data = torch.load(SPATIAL_DATA_PACKED_PATH, weights_only=False)
     
-    if args.data_limit:
+    is_single_file = TEAM_SEQUENCE_FEATURES_PATH.is_file() and TEAM_SEQUENCE_FEATURES_PATH.suffix == ".parquet"
+    is_directory = TEAM_SEQUENCE_FEATURES_PATH.is_dir()
+
+    if args.data_limit and not is_single_file:
         partition_files = sorted(TEAM_SEQUENCE_FEATURES_PATH.glob("part_*.parquet"))
-        if not partition_files:
-            raise FileNotFoundError(f"No partition files found in {TEAM_SEQUENCE_FEATURES_PATH}")
         
         target_match_ids = []
         partitions_to_load = []
@@ -899,6 +902,18 @@ def main():
                 "trails_idx": spatial_data["trails_idx"][valid_indices],
                 "num_samples": len(valid_indices),
             }
+    elif is_single_file:
+        team_sequence_df = pd.read_parquet(TEAM_SEQUENCE_FEATURES_PATH)
+        team_sequence_df = team_sequence_df.fillna(0)
+        if args.data_limit:
+            match_ids = team_sequence_df["matchId"].unique()[:args.data_limit]
+            team_sequence_df = team_sequence_df[team_sequence_df["matchId"].isin(match_ids)]
+    else:
+        team_sequence_df = pd.read_parquet(TEAM_SEQUENCE_FEATURES_PATH)
+        team_sequence_df = team_sequence_df.fillna(0)
+        if args.data_limit:
+            match_ids = team_sequence_df["matchId"].unique()[:args.data_limit]
+            team_sequence_df = team_sequence_df[team_sequence_df["matchId"].isin(match_ids)]
     
     with open(TEAM_SEQUENCE_METADATA_PATH, "r") as meta_file:
         team_sequence_meta = json.load(meta_file)
