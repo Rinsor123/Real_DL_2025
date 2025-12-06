@@ -925,16 +925,16 @@ def train_single_config(
 
 def main():
     parser = argparse.ArgumentParser(description="Spatial-Only Model Training")
-    parser.add_argument("--epochs", type=int, default=MAX_EPOCHS, help="Number of training epochs")
-    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="Batch size")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--cnn-channels", type=int, default=64, help="CNN base channels")
-    parser.add_argument("--cnn-dropout", type=float, default=0.1, help="CNN dropout")
-    parser.add_argument("--spatial-sigma", type=float, default=1.5, help="Spatial decay rate (sigma)")
-    parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY, help="Weight decay")
-    parser.add_argument("--label-smoothing", type=float, default=0.0, help="Label smoothing")
-    parser.add_argument("--seed", type=int, default=RANDOM_SEED, help="Random seed")
-    parser.add_argument("--data-limit", type=int, help="Limit number of games for testing")
+    parser.add_argument("--epochs", type=int, default=MAX_EPOCHS)
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE) 
+    parser.add_argument("--lr", type=float, default=1e-3) 
+    parser.add_argument("--cnn-channels", type=int, default=64) 
+    parser.add_argument("--cnn-dropout", type=float, default=0.1) 
+    parser.add_argument("--spatial-sigma", type=float, default=1.5)
+    parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY)
+    parser.add_argument("--label-smoothing", type=float, default=0.0) 
+    parser.add_argument("--seed", type=int, default=RANDOM_SEED)
+    parser.add_argument("--data-limit", type=int) 
     args = parser.parse_args()
     
     print("Loading data...")
@@ -951,7 +951,7 @@ def main():
         print(f"Error: Spatial data not found at {SPATIAL_DATA_PATH} or {SPATIAL_DATA_PACKED_PATH}")
         return
     
-    #load sequence data (for labels only)
+    #load sequence data 
     if not TEAM_SEQUENCE_FEATURES_PATH.exists() or not TEAM_SEQUENCE_FEATURES_PATH.is_dir():
         print(f"Error: Sequence data directory not found at {TEAM_SEQUENCE_FEATURES_PATH}")
         return
@@ -997,7 +997,7 @@ def main():
         team_sequence_df = team_sequence_df.fillna(0)
         team_sequence_df = team_sequence_df[team_sequence_df["matchId"].isin(target_match_ids)]
         
-        #filter spatial data if packed format
+        #filter spatial data if packed 
         if isinstance(spatial_data, dict) and "meta" in spatial_data:
             def normalize_match_id(mid):
                 mid_str = str(mid)
