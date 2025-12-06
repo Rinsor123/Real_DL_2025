@@ -1,5 +1,5 @@
 # README
-The project is inn simplified terms a model that predicts the probability for an epic monster to be slayed in the MOBA League of legends. This is achieved by creating a hybrid model architecture.<br>
+The project is in simplified terms a model that predicts the probability for an epic monster to be slayed in the MOBA League of legends. This is achieved by creating a hybrid model architecture.<br>
 This folder contains all of the python scripts used for our projects each of these scripts have a use in the pipeline of creating the model.
 
 ### Scripts
