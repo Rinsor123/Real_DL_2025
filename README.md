@@ -1,9 +1,9 @@
 # README
 # Taming the Dragon: Predicting Epic Monster Kills in LoL
 
-This repository contains the implementation for the paper **"Taming the Dragon: Predicting Epic Monster Deaths in League of Legends"**. 
+This repository contains the implementation for the paper "Taming the Dragon: Predicting Epic Monster Deaths in League of Legends". 
 
-It features a **Hybrid Multi-Modal Transformer-CNN** model that fuses temporal game state data (gold, XP curves) with spatial map data (champion positions, vision) to predict Dragon and Baron kills 1, 2, and 3 minutes into the future.
+It features a Hybrid Multi-Modal Transformer-CNN model that fuses temporal game state data (gold, XP curves) with spatial map data (champion positions, vision) to predict Dragon and Baron kills 1, 2, and 3 minutes into the future.
 This folder contains all of the python scripts used for our projects each of these scripts have a use in the pipeline of creating the model.
 
 ### Scripts
