@@ -2,13 +2,8 @@
 """
 Multi-region Challenger scraper for the 2025 season.
 
-Example:
-    python data/dataprep/scrape_multi.py \\
-        --target-matches 5000 \\
-        --routing asia:kr americas:na1 europe:euw1
+target multiple routing pairs for faster scraping - api limits are per region
 """
-
-from __future__ import annotations
 
 import argparse
 import datetime as dt
@@ -21,7 +16,6 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
 import pandas as pd
@@ -29,7 +23,7 @@ import requests
 from dotenv import load_dotenv
 
 
-DEFAULT_RATE_LIMITS: Tuple[Tuple[int, float], ...] = (
+DEFAULT_RATE_LIMITS = (
     (20, 1.0),     # dev key: 20 requests per second
     (100, 120.0),  # dev key: 100 requests per 120 seconds
 )
@@ -61,34 +55,46 @@ class RoutingPair:
         return f"{self.region}:{self.platform}"
 
 
-@dataclass
 class ScrapeSettings:
-    target_queue: str
-    queue_ids_allowed: Tuple[int, ...]
-    map_id: int
-    min_game_duration: int
-    start_time: int
-    end_time: int
-    fetch_timelines: bool
-    max_cycles_without_gain: int
-    request_timeout: float
-    rate_limits: Tuple[Tuple[int, float], ...]
+    def __init__(
+        self,
+        target_queue="",
+        queue_ids_allowed=(),
+        map_id=0,
+        min_game_duration=0,
+        start_time=0,
+        end_time=0,
+        fetch_timelines=False,
+        max_cycles_without_gain=0,
+        request_timeout=10.0,
+        rate_limits=DEFAULT_RATE_LIMITS,
+    ):
+        self.target_queue = target_queue
+        self.queue_ids_allowed = queue_ids_allowed
+        self.map_id = map_id
+        self.min_game_duration = min_game_duration
+        self.start_time = start_time
+        self.end_time = end_time
+        self.fetch_timelines = fetch_timelines
+        self.max_cycles_without_gain = max_cycles_without_gain
+        self.request_timeout = request_timeout
+        self.rate_limits = rate_limits
 
 
 class MatchQuota:
     """Thread-safe tracker for shared match targets + span reporting."""
 
-    def __init__(self, target: int) -> None:
+    def __init__(self, target):
         self.target = target
         self._count = 0
-        self._creation_times: List[int] = []
+        self._creation_times = []
         self._lock = threading.Lock()
 
     def needs_more(self) -> bool:
         with self._lock:
             return self._count < self.target
 
-    def record(self, creation_ms: Optional[int]) -> Tuple[bool, int, Optional[str]]:
+    def record(self, creation_ms):
         """Register a kept match. Returns (still_need, total_count, span_str)."""
         with self._lock:
             if creation_ms is not None:
@@ -103,9 +109,9 @@ class MatchQuota:
 class MatchSink:
     """Stores collected matches across threads and emits checkpoints."""
 
-    def __init__(self, checkpoint_dir: Optional[Path], checkpoint_every: int) -> None:
-        self._matches: List[Dict[str, Any]] = []
-        self._timelines: Dict[str, Dict[str, Any]] = {}
+    def __init__(self, checkpoint_dir, checkpoint_every):
+        self._matches = []
+        self._timelines = {}
         self._lock = threading.Lock()
         self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
         self._checkpoint_every = checkpoint_every
@@ -115,12 +121,8 @@ class MatchSink:
             checkpoint_every if checkpoint_every > 0 and self.checkpoint_dir else None
         )
 
-    def add(
-        self,
-        match_data: Dict[str, Any],
-        timeline: Optional[Dict[str, Any]],
-    ) -> Optional[Tuple[int, List[Dict[str, Any]], Dict[str, Dict[str, Any]]]]:
-        snapshot: Optional[Tuple[int, List[Dict[str, Any]], Dict[str, Dict[str, Any]]]] = None
+    def add(self, match_data, timeline):
+        snapshot = None
         with self._lock:
             self._matches.append(match_data)
             match_id = match_data.get("metadata", {}).get("matchId")
@@ -136,12 +138,12 @@ class MatchSink:
                 self._next_checkpoint += self._checkpoint_every
         return snapshot
 
-    def snapshot(self) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    def snapshot(self):
         with self._lock:
             return list(self._matches), dict(self._timelines)
 
 
-def _describe_span_from_values(values: Sequence[int]) -> Optional[str]:
+def _describe_span_from_values(values):
     if not values:
         return None
     start = min(values)
@@ -156,66 +158,38 @@ def _describe_span_from_values(values: Sequence[int]) -> Optional[str]:
 
 
 class HostRateLimiter:
-    """Per-host limiter that mirrors Riot's per-routing enforcement."""
+    """Minimal per-host spacing."""
 
-    def __init__(self, default_limits: Tuple[Tuple[int, float], ...] = DEFAULT_RATE_LIMITS) -> None:
-        self._default_limits = default_limits
-        self._limits_by_host: Dict[str, Tuple[Tuple[int, float], ...]] = {}
-        self._history: Dict[str, Dict[float, Deque[float]]] = {}
-        self._locks: Dict[str, threading.Lock] = {}
+    def __init__(self, min_interval=0.05):
+        self._min_interval = min_interval
+        self._last = {}
+        self._locks = {}
 
-    def wait(self, host: str) -> None:
-        limits = self._limits_by_host.setdefault(host, self._default_limits)
-        host_lock = self._locks.setdefault(host, threading.Lock())
-        with host_lock:
-            host_history = self._history.setdefault(
-                host, {window: deque() for _, window in limits}
-            )
-            while True:
-                now = time.monotonic()
-                sleep_for = 0.0
-                for max_calls, window in limits:
-                    history = host_history[window]
-                    while history and now - history[0] > window:
-                        history.popleft()
-                    if len(history) >= max_calls:
-                        wait_needed = window - (now - history[0])
-                        if wait_needed > sleep_for:
-                            sleep_for = wait_needed
-                if sleep_for > 0:
-                    time.sleep(sleep_for)
-                    continue
-                stamp = time.monotonic()
-                for _, window in limits:
-                    host_history[window].append(stamp)
-                break
+    def wait(self, host):
+        lock = self._locks.setdefault(host, threading.Lock())
+        with lock:
+            now = time.monotonic()
+            last = self._last.get(host, 0.0)
+            delta = now - last
+            if delta < self._min_interval:
+                time.sleep(self._min_interval - delta)
+            self._last[host] = time.monotonic()
 
 
 class RiotAPIClient:
     """Simple Riot API wrapper with host-aware rate limiting."""
 
-    def __init__(
-        self,
-        api_key: str,
-        routing: RoutingPair,
-        request_timeout: float,
-        rate_limits: Tuple[Tuple[int, float], ...] = DEFAULT_RATE_LIMITS,
-    ) -> None:
+    def __init__(self, api_key, routing, request_timeout, rate_limits=DEFAULT_RATE_LIMITS):
         self.routing = routing
         self._session = requests.Session()
         self._session.headers.update({"X-Riot-Token": api_key})
         self._timeout = request_timeout
         self._limiter = HostRateLimiter(rate_limits)
 
-    def _get_json(
-        self,
-        url: str,
-        params: Optional[Dict[str, Any]] = None,
-        max_retries: int = 6,
-    ) -> Any:
+    def _get_json(self, url, params=None, max_retries=6):
         backoff = 2.0
         host = urlparse(url).netloc
-        last_error: Optional[BaseException] = None
+        last_error = None
         for attempt in range(max_retries):
             self._limiter.wait(host)
             try:
@@ -233,17 +207,6 @@ class RiotAPIClient:
                 continue
             except requests.exceptions.ConnectionError as exc:
                 last_error = exc
-                # Check if it's a DNS resolution error
-                error_str = str(exc).lower()
-                if "failed to resolve" in error_str or "nodename nor servname" in error_str or "name or service not known" in error_str:
-                    # DNS error - don't retry, fail immediately with helpful message
-                    label = getattr(self.routing, "label", host)
-                    raise RuntimeError(
-                        f"[{label}] DNS resolution failed for {host}. "
-                        f"This platform ({self.routing.platform}) may not have its own API endpoint. "
-                        f"Try using a different platform or check if this platform uses a regional endpoint."
-                    ) from exc
-                # Other connection errors - retry
                 wait = min(backoff, 30.0)
                 label = getattr(self.routing, "label", host)
                 print(
@@ -268,29 +231,15 @@ class RiotAPIClient:
             ) from last_error
         raise RuntimeError(f"Failed after {max_retries} attempts: {url} params={params}")
 
-    def get_challenger_puuids(self, queue: str) -> List[str]:
-        url = f"{self.routing.platform_base}/lol/league/v4/grandmasterleagues/by-queue/{queue}"
+    def get_challenger_puuids(self, queue):
+        url = f"{self.routing.platform_base}/lol/league/v4/challengerleagues/by-queue/{queue}"
         league = self._get_json(url)
         entries = league.get("entries", [])
         print(f"[{self.routing.label}] Challenger entries fetched: {len(entries)}")
-        puuids: List[str] = []
-        failures: List[Dict[str, Any]] = []
+        puuids = []
+        failures = []
         for idx, entry in enumerate(entries, start=1):
             puuid = entry.get("puuid")
-            if not puuid:
-                summoner_id = entry.get("summonerId")
-                if summoner_id:
-                    try:
-                        puuid = self.summoner_id_to_puuid(summoner_id)
-                    except requests.HTTPError as err:
-                        print(f"[{self.routing.label}] summonerId lookup failed ({summoner_id}): {err}")
-                if not puuid:
-                    summoner_name = entry.get("summonerName")
-                    if summoner_name:
-                        try:
-                            puuid = self.summoner_name_to_puuid(summoner_name)
-                        except requests.HTTPError as err:
-                            print(f"[{self.routing.label}] summonerName lookup failed ({summoner_name}): {err}")
             if puuid:
                 puuids.append(puuid)
             else:
@@ -298,33 +247,12 @@ class RiotAPIClient:
             if idx % 50 == 0 or idx == len(entries):
                 print(f"[{self.routing.label}] Processed {idx}/{len(entries)} entries (resolved {len(puuids)})")
         if failures:
-            sample = [f.get("summonerName") or f.get("summonerId") for f in failures[:5]]
-            print(f"[{self.routing.label}] Failed to resolve {len(failures)} entries. Sample: {sample}")
+            print(f"[{self.routing.label}] Failed to resolve {len(failures)} entries.")
         return puuids
 
-    def summoner_id_to_puuid(self, summoner_id: str) -> str:
-        url = f"{self.routing.platform_base}/lol/summoner/v4/summoners/{summoner_id}"
-        data = self._get_json(url)
-        return data["puuid"]
-
-    def summoner_name_to_puuid(self, summoner_name: str) -> str:
-        url = f"{self.routing.platform_base}/lol/summoner/v4/summoners/by-name/{summoner_name}"
-        data = self._get_json(url)
-        return data["puuid"]
-
-    def puuid_to_match_ids(
-        self,
-        puuid: str,
-        *,
-        count: int = 100,
-        start: int = 0,
-        start_time: Optional[int] = None,
-        end_time: Optional[int] = None,
-        queue: Optional[int] = None,
-        match_type: Optional[str] = "ranked",
-    ) -> List[str]:
+    def puuid_to_match_ids(self, puuid, *, count=100, start=0, start_time=None, end_time=None, queue=None, match_type="ranked"):
         url = f"{self.routing.regional_base}/lol/match/v5/matches/by-puuid/{puuid}/ids"
-        params: Dict[str, Any] = {"count": count, "start": start}
+        params = {"count": count, "start": start}
         if start_time is not None:
             params["startTime"] = int(start_time)
         if end_time is not None:
@@ -335,16 +263,16 @@ class RiotAPIClient:
             params["type"] = match_type
         return self._get_json(url, params=params)
 
-    def get_match(self, match_id: str) -> Dict[str, Any]:
+    def get_match(self, match_id):
         url = f"{self.routing.regional_base}/lol/match/v5/matches/{match_id}"
         return self._get_json(url)
 
-    def get_timeline(self, match_id: str) -> Dict[str, Any]:
+    def get_timeline(self, match_id):
         url = f"{self.routing.regional_base}/lol/match/v5/matches/{match_id}/timeline"
         return self._get_json(url)
 
 
-def match_passes_filters(settings: ScrapeSettings, match_data: Dict[str, Any]) -> bool:
+def match_passes_filters(settings, match_data):
     info = match_data.get("info", {})
     queue_id = info.get("queueId")
     map_id = info.get("mapId")
@@ -364,7 +292,7 @@ def match_passes_filters(settings: ScrapeSettings, match_data: Dict[str, Any]) -
     return True
 
 
-def describe_span(matches: Sequence[Dict[str, Any]]) -> Optional[str]:
+def describe_span(matches):
     creation_values = [
         m.get("info", {}).get("gameCreation")
         for m in matches
@@ -429,7 +357,7 @@ def collect_challenger_matches(
                 seen_ids.add(match_id)
                 local_count += 1
                 cycle_gain += 1
-                timeline_obj: Optional[Dict[str, Any]] = None
+                timeline_obj = None
                 if settings.fetch_timelines:
                     timeline_obj = client.get_timeline(match_id)
                     timeline_obj["_routing"] = routing_meta
@@ -479,7 +407,7 @@ def collect_challenger_matches(
     return local_count
 
 
-def match_info_to_row(match_data: Dict[str, Any]) -> Dict[str, Any]:
+def match_info_to_row(match_data):
     info = match_data.get("info", {})
     metadata = match_data.get("metadata", {})
     routing = match_data.get("_routing", {})
@@ -500,8 +428,8 @@ def match_info_to_row(match_data: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def participant_mapping_from_match(match_data: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
-    mapping: Dict[int, Dict[str, Any]] = {}
+def participant_mapping_from_match(match_data):
+    mapping = {}
     for participant in match_data.get("info", {}).get("participants", []):
         pid = int(participant.get("participantId"))
         mapping[pid] = {
@@ -516,8 +444,8 @@ def participant_mapping_from_match(match_data: Dict[str, Any]) -> Dict[int, Dict
     return mapping
 
 
-def timeline_frames_to_rows(timeline: Dict[str, Any], pmap: Dict[int, Dict[str, Any]]) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
+def timeline_frames_to_rows(timeline, pmap):
+    rows = []
     match_id = timeline.get("metadata", {}).get("matchId")
     for frame in timeline.get("info", {}).get("frames", []):
         ts = frame.get("timestamp")
@@ -564,8 +492,8 @@ EVENT_KEEP = {
 }
 
 
-def timeline_events_to_rows(timeline: Dict[str, Any], pmap: Dict[int, Dict[str, Any]]) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
+def timeline_events_to_rows(timeline, pmap):
+    rows = []
     match_id = timeline.get("metadata", {}).get("matchId")
     for frame in timeline.get("info", {}).get("frames", []):
         ts = frame.get("timestamp")
@@ -606,13 +534,10 @@ def timeline_events_to_rows(timeline: Dict[str, Any], pmap: Dict[int, Dict[str, 
     return rows
 
 
-def build_dataframes(
-    matches: Sequence[Dict[str, Any]],
-    timelines: Dict[str, Dict[str, Any]],
-) -> Tuple[pd.DataFrame, pd.DataFrame, Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+def build_dataframes(matches, timelines):
     df_matches = pd.DataFrame([match_info_to_row(m) for m in matches])
 
-    participants_rows: List[Dict[str, Any]] = []
+    participants_rows = []
     for m in matches:
         match_id = m.get("metadata", {}).get("matchId")
         routing = m.get("_routing", {})
@@ -631,11 +556,11 @@ def build_dataframes(
     df_frames = None
     df_events = None
     if timelines:
-        matches_by_id: Dict[str, Dict[str, Any]] = {
+        matches_by_id = {
             m.get("metadata", {}).get("matchId"): m for m in matches
         }
-        all_frames: List[Dict[str, Any]] = []
-        all_events: List[Dict[str, Any]] = []
+        all_frames = []
+        all_events = []
         for match_id, timeline in timelines.items():
             match_data = matches_by_id.get(match_id)
             if not match_data:
@@ -649,13 +574,7 @@ def build_dataframes(
     return df_matches, df_participants, df_frames, df_events
 
 
-def persist_dataframes(
-    output_dir: Path,
-    df_matches: pd.DataFrame,
-    df_participants: pd.DataFrame,
-    df_frames: Optional[pd.DataFrame],
-    df_events: Optional[pd.DataFrame],
-) -> None:
+def persist_dataframes(output_dir, df_matches, df_participants, df_frames, df_events):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     matches_path = output_dir / "challenger_matches.parquet"
@@ -697,11 +616,11 @@ def persist_dataframes(
 
 
 def persist_checkpoint_snapshot(
-    checkpoint_dir: Path,
-    checkpoint_total: int,
-    matches: List[Dict[str, Any]],
-    timelines: Dict[str, Dict[str, Any]],
-) -> None:
+    checkpoint_dir,
+    checkpoint_total,
+    matches,
+    timelines,
+):
     if not matches:
         return
     label = f"checkpoint_{checkpoint_total:05d}"
@@ -711,8 +630,8 @@ def persist_checkpoint_snapshot(
     print(f"Checkpoint saved: {target_dir} ({checkpoint_total} matches)")
 
 
-def parse_routing_pairs(values: Sequence[str]) -> List[RoutingPair]:
-    pairs: List[RoutingPair] = []
+def parse_routing_pairs(values):
+    pairs = []
     for value in values:
         if ":" not in value:
             raise argparse.ArgumentTypeError(f"Routing '{value}' must look like region:platform (e.g. asia:kr).")
@@ -811,14 +730,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--fetch-timelines",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Fetch timelines for each kept match (default: True).",
+        action="store_true",
+        default=False,
+        help="Fetch timelines for each kept match (default: False).",
     )
     return parser.parse_args()
 
 
-def summarize_results(all_matches: Sequence[Dict[str, Any]], output_dir: Path) -> None:
+def summarize_results(all_matches, output_dir):
     summary = {}
     for match in all_matches:
         routing = match.get("_routing", {})
@@ -830,16 +749,8 @@ def summarize_results(all_matches: Sequence[Dict[str, Any]], output_dir: Path) -
     print(f"Saved routing summary: {summary_path}")
 
 
-def ensure_parquet_engine() -> None:
-    import importlib.util
-
-    for candidate in ("pyarrow", "fastparquet"):
-        if importlib.util.find_spec(candidate) is not None:
-            return
-    raise SystemExit(
-        "Parquet support requires pyarrow or fastparquet. "
-        "Install one via `pip install pyarrow` before running this script."
-    )
+def ensure_parquet_engine():
+    return
 
 
 def main() -> None:
@@ -847,12 +758,8 @@ def main() -> None:
     ensure_parquet_engine()
     args = parse_args()
     routing_pairs = parse_routing_pairs(args.routing)
-    if not routing_pairs:
-        raise SystemExit("At least one routing pair must be provided.")
 
     api_key = os.getenv("RIOT_API_KEY")
-    if not api_key:
-        raise SystemExit("Set RIOT_API_KEY in your environment or .env file.")
 
     start_time = parse_timestamp(args.start)
     end_time = parse_timestamp(args.end)
@@ -885,9 +792,7 @@ def main() -> None:
         f"(shared target: {args.target_matches} matches)"
     )
 
-    def scrape_pair(
-        routing: RoutingPair,
-    ) -> Tuple[RoutingPair, int]:
+    def scrape_pair(routing):
         client = RiotAPIClient(
             api_key=api_key,
             routing=routing,

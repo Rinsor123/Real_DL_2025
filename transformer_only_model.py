@@ -1,17 +1,9 @@
-"""
-Transformer-Only Model for Objective Prediction
-Uses only temporal sequence features 
-Predicts team-specific dragon/baron kills in the next 3 minutes.
-"""
-
 import argparse
 import json
 import math
 import os
 import random
-from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Tuple, Dict, List
 import numpy as np
 import pandas as pd
 import torch
@@ -35,7 +27,7 @@ WANDB_PROJECT = os.getenv("WANDB_PROJECT", "transformer-only-model")
 WANDB_ENTITY = os.getenv("WANDB_ENTITY")
 
 
-def init_wandb_run(name: str, job_type: str, config: dict | None = None, tags: list[str] | None = None):
+def init_wandb_run(name, job_type, config=None, tags=None):
     if not (USE_WANDB and WANDB_AVAILABLE):
         return None
     try:
@@ -85,20 +77,34 @@ OUTPUT_DIR = DATA_ROOT / "transformer_only_model"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-@dataclass
 class TrainConfig:
-    d_model: int = 128
-    n_layers: int = 2
-    d_ff_multiplier: float = 3.0
-    transformer_dropout: float = 0.1
-    max_history_minutes: str | int = "all"
-    batch_size: int = BATCH_SIZE
-    lr: float = 1e-3
-    weight_decay: float = WEIGHT_DECAY
-    max_epochs: int = MAX_EPOCHS
-    patience: int = EARLY_STOPPING_PATIENCE
-    label_smoothing: float = 0.0
-    seed: int = RANDOM_SEED
+    def __init__(
+        self,
+        d_model=128,
+        n_layers=2,
+        d_ff_multiplier=3.0,
+        transformer_dropout=0.1,
+        max_history_minutes="all",
+        batch_size=BATCH_SIZE,
+        lr=1e-3,
+        weight_decay=WEIGHT_DECAY,
+        max_epochs=MAX_EPOCHS,
+        patience=EARLY_STOPPING_PATIENCE,
+        label_smoothing=0.0,
+        seed=RANDOM_SEED,
+    ):
+        self.d_model = d_model
+        self.n_layers = n_layers
+        self.d_ff_multiplier = d_ff_multiplier
+        self.transformer_dropout = transformer_dropout
+        self.max_history_minutes = max_history_minutes
+        self.batch_size = batch_size
+        self.lr = lr
+        self.weight_decay = weight_decay
+        self.max_epochs = max_epochs
+        self.patience = patience
+        self.label_smoothing = label_smoothing
+        self.seed = seed
 
 class TransformerEncoder(nn.Module):
     """
@@ -106,13 +112,13 @@ class TransformerEncoder(nn.Module):
     """
     def __init__(
         self,
-        feature_dim: int,
-        d_model: int = 128,
-        nhead: int = 4,
-        num_layers: int = 2,
-        max_seq_len: int = 64,
-        dim_feedforward: int | None = None,
-        dropout: float = 0.1,
+        feature_dim,
+        d_model=128,
+        nhead=4,
+        num_layers=2,
+        max_seq_len=64,
+        dim_feedforward=None,
+        dropout=0.1,
     ):
         super().__init__()
         self.input_proj = nn.Linear(feature_dim, d_model)
@@ -135,7 +141,7 @@ class TransformerEncoder(nn.Module):
             torch.triu(torch.ones(max_seq_len, max_seq_len, dtype=torch.bool), diagonal=1)
         )
 
-    def forward(self, x: torch.Tensor, src_key_padding_mask: torch.Tensor | None = None):
+    def forward(self, x, src_key_padding_mask=None):
         h = self.input_proj(x)
         seq_len = x.size(1)
         causal_mask = self.causal_mask[:seq_len, :seq_len]
@@ -150,15 +156,15 @@ class TransformerOnlyModel(nn.Module):
     """
     def __init__(
         self,
-        sequence_feature_dim: int,
-        d_model: int = 128,
-        n_layers: int = 2,
-        d_ff_multiplier: float = 3.0,
-        transformer_dropout: float = 0.1,
-        hidden_dim: int = 256,
-        hidden_dropout: float = 0.2,
-        max_seq_len: int = 64,
-        num_labels: int = 2,
+        sequence_feature_dim,
+        d_model=128,
+        n_layers=2,
+        d_ff_multiplier=3.0,
+        transformer_dropout=0.1,
+        hidden_dim=256,
+        hidden_dropout=0.2,
+        max_seq_len=64,
+        num_labels=2,
     ):
         super().__init__()
         
@@ -192,12 +198,7 @@ class TransformerOnlyModel(nn.Module):
         self.max_seq_len = max_seq_len
         self.num_labels = num_labels
 
-    def forward(
-        self,
-        sequence_features: torch.Tensor,
-        src_key_padding_mask: torch.Tensor | None = None,
-        valid_lengths: torch.Tensor = None,
-    ):
+    def forward(self, sequence_features, src_key_padding_mask=None, valid_lengths=None):
         """
         Many-to-One forward pass.
         """
@@ -241,13 +242,13 @@ class TransformerOnlyDataset(Dataset):
     """
     def __init__(
         self,
-        sequence_df: pd.DataFrame,
-        feature_cols: List[str],
-        label_cols: List[str],
-        eligibility_cols: List[str] | None = None,
-        max_seq_len: int | None = MAX_SEQ_LEN,
-        stride: int = 1,
-        min_history: int = 1,
+        sequence_df,
+        feature_cols,
+        label_cols,
+        eligibility_cols=None,
+        max_seq_len=MAX_SEQ_LEN,
+        stride=1,
+        min_history=1,
     ):
         grouped = sequence_df.sort_values(["matchId", "teamId", "minute"])
         sequences = []
@@ -292,8 +293,8 @@ class TransformerOnlyDataset(Dataset):
 
     def __len__(self):
         return len(self.sequences)
-
-    def __getitem__(self, idx: int) -> Dict:
+    
+    def __getitem__(self, idx):
         item = self.sequences[idx]
         seq, lbl, elig = item["seq"], item["labels"], item["elig"]
         valid_len = len(seq)
@@ -353,7 +354,7 @@ def compute_loss(logits: torch.Tensor, targets: torch.Tensor, valid_mask: torch.
     return loss
 
 def evaluate_model(model: nn.Module, loader: DataLoader, pos_weight: torch.Tensor,
-                   num_labels: int, device: torch.device, label_smoothing: float = 0.0) -> Dict:
+                   num_labels: int, device: torch.device, label_smoothing: float = 0.0):
     model.eval()
     total_loss = 0.0
     total_weight = 0.0
@@ -481,14 +482,14 @@ def _compute_pos_weight(df: pd.DataFrame, label_col: str, eligibility_col: str |
     return max(1.0, (neg + 1e-6) / (pos + 1e-6))
 
 def train_single_config(
-    config: TrainConfig,
-    train_df: pd.DataFrame,
-    val_df: pd.DataFrame,
-    test_df: pd.DataFrame,
-    feature_cols: List[str],
-    label_cols: List[str],
-    eligibility_cols: List[str],
-    pos_weight: torch.Tensor,
+    config,
+    train_df,
+    val_df,
+    test_df,
+    feature_cols,
+    label_cols,
+    eligibility_cols,
+    pos_weight,
 ):
     set_global_seed(config.seed)
     
@@ -519,7 +520,7 @@ def train_single_config(
         name="transformer-only-run",
         job_type="train",
         tags=["transformer-only"],
-        config={**asdict(config), "feature_dim": len(feature_cols), "num_labels": len(label_cols)},
+        config={**config.__dict__, "feature_dim": len(feature_cols), "num_labels": len(label_cols)},
     )
     
     model = TransformerOnlyModel(
@@ -607,7 +608,7 @@ def train_single_config(
     #save checkpoint
     model_path = OUTPUT_DIR / "best_model.pt"
     torch.save({
-        "config": asdict(config),
+        "config": config.__dict__,
         "state_dict": best_state,
         "val_macro_pr_auc": best_val_metric,
         "test_metrics": test_metrics,
@@ -616,7 +617,7 @@ def train_single_config(
     summary_path = OUTPUT_DIR / "summary.json"
     with open(summary_path, "w") as fp:
         json.dump({
-            "config": asdict(config),
+            "config": config.__dict__,
             "best_epoch": best_epoch,
             "val_macro_pr_auc": best_val_metric,
             "best_val_metrics": best_val_metrics,

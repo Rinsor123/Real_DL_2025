@@ -1,4 +1,3 @@
-import argparse
 import json
 import os
 import random
@@ -8,8 +7,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-
-#define constants
+#define paths
 DATA_ROOT = Path(os.getenv("DATA_ROOT", "/project/project_465002423/Deep-Learning-Project-2025/combined_data"))
 OUTPUT_ROOT = Path(os.getenv("DATA_ROOT", "/project/project_465002423/Deep-Learning-Project-2025/combined_data"))
 CHECKPOINT_DIR = OUTPUT_ROOT / "preprocessing_checkpoints"
@@ -119,7 +117,7 @@ def load_and_deduplicate(limit=None):
     
     return matches, participants, frames, events, sorted(unique_match_ids)
 
-#spatial data prep$ 
+#spatial data prep
 def preprocess_spatial(matches, frames, events, game_ids, resume_from=0):
     print("\nGenerating Spatial Data") 
     print('-' * 70)
@@ -362,7 +360,7 @@ def preprocess_sequence(matches, participants, frames, events, game_ids):
     """
     generate sequence data for transformer model
     """
-    print("\ngenerating Sequence Data$")
+    print("\ngenerating Sequence Data")
     print('-'*70)
     
     #build minute level champion rows
@@ -392,55 +390,37 @@ def preprocess_sequence(matches, participants, frames, events, game_ids):
         .assign(participantId=lambda df: df["participantId"].astype(int))
     )
     
-    def vectorized_infer_team(df, team_lookup_df):
-        """
-        team inference using merge operations 
-        """
-        result = df["teamId"].copy()
-        
-        mask = result.isna() & df["creatorId"].notna()
-        if mask.any():
-            merge_df = df.loc[mask, ["matchId", "creatorId"]].copy()
-            merge_df["creatorId"] = merge_df["creatorId"].astype(int)
-            merged = merge_df.merge(
-                team_lookup_df, 
-                left_on=["matchId", "creatorId"], 
-                right_on=["matchId", "participantId"], 
-                how="left"
-            )["teamId"]
-            result.loc[mask] = merged.values
-        
-        #if nothing use killerId
-        mask = result.isna() & df["killerId"].notna()
-        if mask.any():
-            merge_df = df.loc[mask, ["matchId", "killerId"]].copy()
-            merge_df["killerId"] = merge_df["killerId"].astype(int)
-            merged = merge_df.merge(
-                team_lookup_df, 
-                left_on=["matchId", "killerId"], 
-                right_on=["matchId", "participantId"], 
-                how="left"
-            )["teamId"]
-            result.loc[mask] = merged.values
-        
-        #if nothing try participantId
-        mask = result.isna() & df["participantId"].notna()
-        if mask.any():
-            merge_df = df.loc[mask, ["matchId", "participantId"]].copy()
-            merge_df["participantId"] = merge_df["participantId"].astype(int)
-            merged = merge_df.merge(
-                team_lookup_df, 
-                on=["matchId", "participantId"], 
-                how="left"
-            )["teamId"]
-            result.loc[mask] = merged.values
-        
-        return result
+    def infer_team(df, team_lookup_df):
+        df = df.copy()
+        for col in ("creatorId", "killerId", "participantId"):
+            if col in df.columns:
+                df[col] = df[col].astype("Int64")
+        merged = df.merge(
+            team_lookup_df.rename(columns={"participantId": "creatorId"}),
+            on=["matchId", "creatorId"],
+            how="left",
+            suffixes=("", "_m1"),
+        )
+        if "killerId" in df.columns:
+            merged = merged.merge(
+                team_lookup_df.rename(columns={"participantId": "killerId", "teamId": "teamId_k"}),
+                on=["matchId", "killerId"],
+                how="left",
+            )
+        if "participantId" in df.columns:
+            merged = merged.merge(
+                team_lookup_df.rename(columns={"teamId": "teamId_p"}),
+                on=["matchId", "participantId"],
+                how="left",
+            )
+        team_cols = [c for c in ["teamId", "teamId_k", "teamId_p"] if c in merged.columns]
+        merged["teamId"] = merged[team_cols].bfill(axis=1).iloc[:, 0]
+        return merged["teamId"]
     
     #ward events 
     ward_events = events[events["eventType"].isin(["WARD_PLACED", "WARD_KILL"])].copy()
     ward_events = ward_events.dropna(subset=["timestamp"]).reset_index(drop=True)
-    ward_events["eventTeamId"] = vectorized_infer_team(ward_events, team_lookup_df)
+    ward_events["eventTeamId"] = infer_team(ward_events, team_lookup_df)
     ward_events = ward_events.dropna(subset=["eventTeamId"]).copy()
     ward_events["eventTeamId"] = ward_events["eventTeamId"].astype(int)
     print(f"Ward events with team info: {len(ward_events)}")
@@ -465,7 +445,7 @@ def preprocess_sequence(matches, participants, frames, events, game_ids):
     )
     team_minutes_df["absolute_game_time_sec"] = team_minutes_df["game_time_ms"] / 1000.0
     
-    def count_events_vectorized(df, event_index, time_col, window_ms=FRAME_INTERVAL_MS):
+    def count_events(df, event_index, time_col, window_ms=FRAME_INTERVAL_MS):
         """
         count events in window for all rows 
         """
@@ -481,16 +461,17 @@ def preprocess_sequence(matches, participants, frames, events, game_ids):
             times = group[time_col].values.astype(np.int64)
             
             #binary search
+            #we struggled a lot with RAM usage in this script, the use pf np.searchsorted helped quite a bit
             hi = np.searchsorted(ts_arr, times, side='right')
             lo = np.searchsorted(ts_arr, times - window_ms, side='right')
             results[group.index] = hi - lo
         
         return results
     
-    team_minutes_df["wards_placed_last_minute"] = count_events_vectorized(
+    team_minutes_df["wards_placed_last_minute"] = count_events(
         team_minutes_df, ward_place_index, "game_time_ms"
     )
-    team_minutes_df["wards_killed_last_minute"] = count_events_vectorized(
+    team_minutes_df["wards_killed_last_minute"] = count_events(
         team_minutes_df, ward_kill_index, "game_time_ms"
     )
     print(f"Team-minute rows: {len(team_minutes_df)}")
@@ -514,7 +495,7 @@ def preprocess_sequence(matches, participants, frames, events, game_ids):
     for ts_list in death_index.values():
         ts_list.sort()
     
-    def time_since_last_vectorized(df, event_index, time_col):
+    def time_since_last(df, event_index, time_col):
         """
         compute time since last event for all rows 
         """
@@ -536,7 +517,7 @@ def preprocess_sequence(matches, participants, frames, events, game_ids):
         
         return results
     
-    minute_df["time_since_last_death_sec"] = time_since_last_vectorized(
+    minute_df["time_since_last_death_sec"] = time_since_last(
         minute_df, death_index, "game_time_ms"
     )
     max_game_seconds = float(minute_df["absolute_game_time_sec"].max())
@@ -564,7 +545,7 @@ def preprocess_sequence(matches, participants, frames, events, game_ids):
     epic_events["timestamp"] = epic_events["timestamp"].astype(int)
     
     epic_events_team = epic_events.copy()
-    epic_events_team["eventTeamId"] = vectorized_infer_team(epic_events_team, team_lookup_df)
+    epic_events_team["eventTeamId"] = infer_team(epic_events_team, team_lookup_df)
     epic_events_team = epic_events_team.dropna(subset=["eventTeamId"]).copy()
     epic_events_team["eventTeamId"] = epic_events_team["eventTeamId"].astype(int)
     
@@ -598,7 +579,7 @@ def preprocess_sequence(matches, participants, frames, events, game_ids):
     team_future_dragon = monster_team_histories["dragon"]
     team_future_baron = monster_team_histories["baron"]
     
-    def time_since_match_event_vectorized(df, event_index, time_col):
+    def time_since_match_event(df, event_index, time_col):
         """
         compute time since last event for all rows on match level.
         """
@@ -621,7 +602,7 @@ def preprocess_sequence(matches, participants, frames, events, game_ids):
     
     for label, history in monster_match_histories.items():
         col = f"time_since_last_{label}_sec"
-        match_minutes_df[col] = time_since_match_event_vectorized(match_minutes_df, history, "game_time_ms")
+        match_minutes_df[col] = time_since_match_event(match_minutes_df, history, "game_time_ms")
     
     match_duration_cap = float(match_minutes_df["absolute_game_time_sec"].max())
     time_since_cols = [f"time_since_last_{label}_sec" for label in OBJECTIVE_MONSTER_TYPES.keys()]
@@ -630,7 +611,7 @@ def preprocess_sequence(matches, participants, frames, events, game_ids):
             match_minutes_df[col].replace([np.inf, -np.inf], match_duration_cap).fillna(match_duration_cap)
         )
     
-    def cumulative_kills_vectorized(df, event_index, time_col):
+    def cumulative_kills(df, event_index, time_col):
         """
         count cumulative events up to current time for all rows
         """
@@ -649,7 +630,7 @@ def preprocess_sequence(matches, participants, frames, events, game_ids):
     
     for label, history in monster_team_histories.items():
         col = f"{label}_kills"
-        team_minutes_df[col] = cumulative_kills_vectorized(team_minutes_df, history, "game_time_ms")
+        team_minutes_df[col] = cumulative_kills(team_minutes_df, history, "game_time_ms")
     
     #dragon type tracking
     dragon_events = epic_events[epic_events["monsterType"] == "DRAGON"].copy()
@@ -666,7 +647,7 @@ def preprocess_sequence(matches, participants, frames, events, game_ids):
     for (m_id, team_id) in monster_team_histories["dragon"].keys():
         match_teams_map[m_id].add(team_id)
     
-    def get_next_dragon_types_vectorized(df, dragon_history, dragon_team_history, match_teams_map):
+    def get_next_dragon_types(df, dragon_history, dragon_team_history, match_teams_map):
         """
         compute next dragon type 
         """
@@ -726,7 +707,7 @@ def preprocess_sequence(matches, participants, frames, events, game_ids):
         results.sort(key=lambda x: x[0])
         return [r[1] for r in results]
     
-    team_minutes_df["next_dragon_type"] = get_next_dragon_types_vectorized(
+    team_minutes_df["next_dragon_type"] = get_next_dragon_types(
         team_minutes_df, dragon_match_history, monster_team_histories["dragon"], match_teams_map
     )
     
@@ -845,7 +826,7 @@ def preprocess_sequence(matches, participants, frames, events, game_ids):
     print("Added epic objective cooldowns")
     
     #lookahead labels
-    def event_in_future_window_vectorized(df, event_index, time_col, horizon_ms=LOOKAHEAD_MS):
+    def event_in_future_window(df, event_index, time_col, horizon_ms=LOOKAHEAD_MS):
         """
         Check if any event occurs in (current_time, current_time + horizon] for all rows.
         """
@@ -866,22 +847,22 @@ def preprocess_sequence(matches, participants, frames, events, game_ids):
         return results
     
     #generate labels for 1, 2, and 3 minute horizons
-    team_minutes_df["dragon_taken_next_1min"] = event_in_future_window_vectorized(
+    team_minutes_df["dragon_taken_next_1min"] = event_in_future_window(
         team_minutes_df, team_future_dragon, "game_time_ms", horizon_ms=LOOKAHEAD_1MIN_MS
     )
-    team_minutes_df["dragon_taken_next_2min"] = event_in_future_window_vectorized(
+    team_minutes_df["dragon_taken_next_2min"] = event_in_future_window(
         team_minutes_df, team_future_dragon, "game_time_ms", horizon_ms=LOOKAHEAD_2MIN_MS
     )
-    team_minutes_df["dragon_taken_next_3min"] = event_in_future_window_vectorized(
+    team_minutes_df["dragon_taken_next_3min"] = event_in_future_window(
         team_minutes_df, team_future_dragon, "game_time_ms", horizon_ms=LOOKAHEAD_MS
     )
-    team_minutes_df["baron_taken_next_1min"] = event_in_future_window_vectorized(
+    team_minutes_df["baron_taken_next_1min"] = event_in_future_window(
         team_minutes_df, team_future_baron, "game_time_ms", horizon_ms=LOOKAHEAD_1MIN_MS
     )
-    team_minutes_df["baron_taken_next_2min"] = event_in_future_window_vectorized(
+    team_minutes_df["baron_taken_next_2min"] = event_in_future_window(
         team_minutes_df, team_future_baron, "game_time_ms", horizon_ms=LOOKAHEAD_2MIN_MS
     )
-    team_minutes_df["baron_taken_next_3min"] = event_in_future_window_vectorized(
+    team_minutes_df["baron_taken_next_3min"] = event_in_future_window(
         team_minutes_df, team_future_baron, "game_time_ms", horizon_ms=LOOKAHEAD_MS
     )
     
@@ -1092,10 +1073,7 @@ def main(limit=None, skip_spatial=False, skip_sequence=False, resume=False):
         with open(spatial_progress_path, 'r') as f:
             progress = json.load(f)
         resume_from = progress.get('last_game_idx', 0)
-        print(f"\nResuming from checkpoint")
-        print('-' * 70)
-        print(f"Last checkpoint: game {resume_from}, {progress.get('total_samples', 0)} samples")
-        print(f"Checkpoint time: {progress.get('timestamp', 'unknown')}")
+        print(f"Resume checkpoint: game {resume_from}, samples {progress.get('total_samples', 0)}, time {progress.get('timestamp', 'unknown')}")
     
     #load and deduplicate data
     matches, participants, frames, events, game_ids = load_and_deduplicate(limit)
@@ -1104,7 +1082,7 @@ def main(limit=None, skip_spatial=False, skip_sequence=False, resume=False):
     game_ids_path = OUTPUT_ROOT / "processed_game_ids.json"
     with open(game_ids_path, "w") as f:
         json.dump(game_ids, f)
-    print(f"\nSaved {len(game_ids)} game IDs to {game_ids_path}")
+    print(f"Saved {len(game_ids)} game IDs to {game_ids_path}")
     
     # generate spatial data
     if not skip_spatial:
@@ -1124,7 +1102,7 @@ def main(limit=None, skip_spatial=False, skip_sequence=False, resume=False):
         total_games = len(game_ids)
         num_batches = (total_games + batch_size - 1) // batch_size
         
-        print(f"\nProcessing sequence data in {num_batches} batches (batch size: {batch_size}))")
+        print(f"Processing sequence data in {num_batches} batches (batch size: {batch_size})")
         
         all_champion_dfs = []
         all_team_dfs = []
@@ -1137,7 +1115,7 @@ def main(limit=None, skip_spatial=False, skip_sequence=False, resume=False):
             batch_game_ids = game_ids[start_idx:end_idx]
             batch_game_set = set(batch_game_ids)
             
-            print(f"\n Batch {batch_idx + 1}/{num_batches}: Games {start_idx + 1}-{end_idx} ({len(batch_game_ids)} games)")
+            print(f"Batch {batch_idx + 1}/{num_batches}: games {start_idx + 1}-{end_idx} ({len(batch_game_ids)})")
             
             #filter data to current batch
             batch_matches = matches[matches["matchId"].isin(batch_game_set)].copy()
@@ -1158,13 +1136,9 @@ def main(limit=None, skip_spatial=False, skip_sequence=False, resume=False):
             all_team_dfs.append(team_df)
             all_sequence_dfs.append(sequence_df)
             
-            del batch_matches, batch_participants, batch_frames, batch_events
-            del champion_df, team_df, sequence_df, batch_meta
-            
-            print(f"Batch {batch_idx + 1} complete. Memory usage: {len(all_champion_dfs)} batches collected")
         
         #concatenate all batches
-        print(f"\nConcatenating {num_batches} batches")
+        print(f"Concatenating {num_batches} batches")
         
         #for champion_df, ensure all columns are aligned
         if all_champion_dfs:
@@ -1176,47 +1150,23 @@ def main(limit=None, skip_spatial=False, skip_sequence=False, resume=False):
             aligned_champion_dfs = []
             for df in all_champion_dfs:
                 aligned_df = df.reindex(columns=all_champion_cols, fill_value=0)
-                #convert champion columns to uint8 
-                champ_cols = [c for c in aligned_df.columns if c.startswith('champ_') or c.startswith('_champ_')]
-                if champ_cols:
-                    aligned_df[champ_cols] = aligned_df[champ_cols].astype('uint8')
                 aligned_champion_dfs.append(aligned_df)
             champion_df = pd.concat(aligned_champion_dfs, ignore_index=True)
         else:
             champion_df = pd.DataFrame()
         
         if all_sequence_dfs:
-            all_sequence_cols = set()
-            for df in all_sequence_dfs:
-                all_sequence_cols.update(df.columns)
-            all_sequence_cols = sorted(all_sequence_cols)
+            all_sequence_cols = sorted({col for df in all_sequence_dfs for col in df.columns})
             
             aligned_sequence_dfs = []
             for df in all_sequence_dfs:
                 aligned_df = df.reindex(columns=all_sequence_cols, fill_value=0)
-                champ_cols = [c for c in aligned_df.columns 
-                             if (c.startswith('champ_') or c.startswith('_champ_') or 
-                                 any(c.startswith(role + 'champ_') for role in ['top_', 'jungle_', 'middle_', 'bottom_', 'utility_']))]
-                if champ_cols:
-                    for col in champ_cols:
-                        if col in aligned_df.columns:
-                            aligned_df[col] = pd.to_numeric(aligned_df[col], errors='coerce').fillna(0).astype('uint8')
                 aligned_sequence_dfs.append(aligned_df)
             sequence_df = pd.concat(aligned_sequence_dfs, ignore_index=True)
-            
-            champ_cols = [c for c in sequence_df.columns 
-                         if (c.startswith('champ_') or c.startswith('_champ_') or 
-                             any(c.startswith(role + 'champ_') for role in ['top_', 'jungle_', 'middle_', 'bottom_', 'utility_']))]
-            if champ_cols:
-                print(f"Converting {len(champ_cols)} champion columns to uint8...")
-                for col in champ_cols:
-                    if col in sequence_df.columns:
-                        sequence_df[col] = pd.to_numeric(sequence_df[col], errors='coerce').fillna(0).astype('uint8')
         else:
             sequence_df = pd.DataFrame()
         
         team_df = pd.concat(all_team_dfs, ignore_index=True)
-        del all_champion_dfs, all_team_dfs, all_sequence_dfs
         print(f"Final sizes: champion={len(champion_df)}, team={len(team_df)}, sequence={len(sequence_df)}")
         
         #save results
@@ -1240,19 +1190,5 @@ def main(limit=None, skip_spatial=False, skip_sequence=False, resume=False):
     print(f"Total unique games processed: {len(game_ids)}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Unified preprocessing for spatial and sequence data")
-    parser.add_argument("--limit", type=int, default=None, help="Limit number of games to process")
-    parser.add_argument("--skip-spatial", action="store_true", help="Skip spatial data generation")
-    parser.add_argument("--skip-sequence", action="store_true", help="Skip sequence data generation")
-    parser.add_argument("--resume", action="store_true", help="Resume from last checkpoint if available")
-    parser.add_argument("--checkpoint-interval", type=int, default=2000, 
-                        help="Save checkpoint every N games (default: 2000)")
-    parser.add_argument("--sequence-batch-size", type=int, default=10000,
-                        help="Process sequence data in batches of N games to avoid OOM (default: 10000)")
-    args = parser.parse_args()
-    
-    globals()['CHECKPOINT_INTERVAL'] = args.checkpoint_interval
-    globals()['SEQUENCE_BATCH_SIZE'] = args.sequence_batch_size
-    
-    main(limit=args.limit, skip_spatial=args.skip_spatial, skip_sequence=args.skip_sequence, resume=args.resume)
+    main()
 

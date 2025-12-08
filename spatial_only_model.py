@@ -3,9 +3,7 @@ import json
 import math
 import os
 import random
-from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Tuple, Dict, List
 import numpy as np
 import pandas as pd
 import torch
@@ -39,12 +37,11 @@ def init_wandb_run(name: str, job_type: str, config: dict | None = None, tags: l
         print(f"wandb init failed: {exc}. continuing without logging.")
         return None
 
-#initialize constants
+#initialize rotos
 DATA_ROOT = Path(os.getenv("DATA_ROOT", "/project/project_465002423/Deep-Learning-Project-2025/combined_data"))
 SPATIAL_DATA_PACKED_PATH = DATA_ROOT / "spatial_data_packed.pt"
 TEAM_SEQUENCE_FEATURES_PATH = Path(os.getenv("TEAM_SEQUENCE_FEATURES_PATH", str(DATA_ROOT / "team_sequence_dataset")))
-if not TEAM_SEQUENCE_FEATURES_PATH.is_absolute():
-    TEAM_SEQUENCE_FEATURES_PATH = DATA_ROOT / TEAM_SEQUENCE_FEATURES_PATH
+
 TEAM_SEQUENCE_METADATA_PATH = DATA_ROOT / "team_sequence_metadata.json"
 
 if torch.cuda.is_available():
@@ -91,20 +88,34 @@ def _hash_match_id(match_id: str):
         h = h & 0xFFFFFFFF
     return h & 0x7FFFFFFF
 
-@dataclass
 class TrainConfig:
-    cnn_channels: int = 64
-    cnn_dropout: float = 0.1
-    spatial_sigma: float = 1.5
-    hidden_dim: int = 256
-    hidden_dropout: float = 0.2
-    batch_size: int = BATCH_SIZE
-    lr: float = 1e-3
-    weight_decay: float = WEIGHT_DECAY
-    max_epochs: int = MAX_EPOCHS
-    patience: int = EARLY_STOPPING_PATIENCE
-    label_smoothing: float = 0.0
-    seed: int = RANDOM_SEED
+    def __init__(
+        self,
+        cnn_channels=64,
+        cnn_dropout=0.1,
+        spatial_sigma=1.5,
+        hidden_dim=256,
+        hidden_dropout=0.2,
+        batch_size=BATCH_SIZE,
+        lr=1e-3,
+        weight_decay=WEIGHT_DECAY,
+        max_epochs=MAX_EPOCHS,
+        patience=EARLY_STOPPING_PATIENCE,
+        label_smoothing=0.0,
+        seed=RANDOM_SEED,
+    ):
+        self.cnn_channels = cnn_channels
+        self.cnn_dropout = cnn_dropout
+        self.spatial_sigma = spatial_sigma
+        self.hidden_dim = hidden_dim
+        self.hidden_dropout = hidden_dropout
+        self.batch_size = batch_size
+        self.lr = lr
+        self.weight_decay = weight_decay
+        self.max_epochs = max_epochs
+        self.patience = patience
+        self.label_smoothing = label_smoothing
+        self.seed = seed
 
 class SpatialInputLayer(nn.Module):
     def __init__(self, grid_size=GRID_SIZE, map_size=MAP_SIZE, sigma=1.5, turret_range=1100):
@@ -312,7 +323,7 @@ class SpatialOnlyModel(nn.Module):
         
         self.num_labels = num_labels
 
-    def forward(self, spatial_data: Dict,):
+    def forward(self, spatial_data):
         #process spatial data
         cnn_out = self.cnn(
             spatial_data["player_trails"],
@@ -345,10 +356,10 @@ class SpatialOnlyModel(nn.Module):
 class SpatialOnlyDataset(Dataset):
     def __init__(
         self,
-        sequence_df: pd.DataFrame,
-        spatial_data: Dict[str, torch.Tensor],
-        label_cols: List[str],
-        eligibility_cols: List[str] | None = None,
+        sequence_df,
+        spatial_data,
+        label_cols,
+        eligibility_cols=None,
     ):
         self.packed_data = spatial_data
         self.meta = spatial_data["meta"]
@@ -401,7 +412,7 @@ class SpatialOnlyDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
-    def __getitem__(self, idx: int) -> Dict:
+    def __getitem__(self, idx):
         item = self.samples[idx]
         team_id = item["team_id"]
         
@@ -667,14 +678,14 @@ def _compute_pos_weight(df: pd.DataFrame, label_col: str, eligibility_col: str |
 
 
 def train_single_config(
-    config: TrainConfig,
-    train_df: pd.DataFrame,
-    val_df: pd.DataFrame,
-    test_df: pd.DataFrame,
-    spatial_data: Dict[str, torch.Tensor],
-    label_cols: List[str],
-    eligibility_cols: List[str],
-    pos_weight: torch.Tensor,
+    config,
+    train_df,
+    val_df,
+    test_df,
+    spatial_data,
+    label_cols,
+    eligibility_cols,
+    pos_weight,
 ):
     set_global_seed(config.seed)
     
@@ -700,7 +711,7 @@ def train_single_config(
         name="spatial-only-run",
         job_type="train",
         tags=["spatial-only"],
-        config={**asdict(config), "num_labels": len(label_cols)},
+        config={**config.__dict__, "num_labels": len(label_cols)},
     )
     
     model = SpatialOnlyModel(
@@ -785,7 +796,7 @@ def train_single_config(
     #save checkpoint
     model_path = OUTPUT_DIR / "best_model.pt"
     torch.save({
-        "config": asdict(config),
+        "config": config.__dict__,
         "state_dict": best_state,
         "val_macro_pr_auc": best_val_metric,
         "test_metrics": test_metrics,
@@ -794,7 +805,7 @@ def train_single_config(
     summary_path = OUTPUT_DIR / "summary.json"
     with open(summary_path, "w") as fp:
         json.dump({
-            "config": asdict(config),
+            "config": config.__dict__,
             "best_epoch": best_epoch,
             "val_macro_pr_auc": best_val_metric,
             "best_val_metrics": best_val_metrics,

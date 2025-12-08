@@ -1,28 +1,22 @@
 """
 Packs the spatial data into dense tensors. Ensuring less RAM usage.
 """
-import argparse
 from pathlib import Path
-from typing import Dict, List
 import numpy as np
 import torch
 from tqdm import tqdm
 
 
-def hash_match_id(match_id: str) -> int:
-    h = 5381
-    for char in match_id:
-        h = ((h << 5) + h) + ord(char)
-        h &= 0xFFFFFFFF
-    return np.int32(h & 0x7FFFFFFF)
+def hash_match_id(match_id):
+    return np.int32(hash(match_id) & 0x7FFFFFFF)
 
 
 def pack_spatial_data(
-    spatial_data: List[Dict],
-    output_path: Path,
-    dtype_float: torch.dtype = torch.float16,
-    dtype_int: torch.dtype = torch.int32,
-) -> None:
+    spatial_data,
+    output_path,
+    dtype_float=torch.float16,
+    dtype_int=torch.int32,
+):
     N = len(spatial_data)
     meta = torch.zeros((N, 2), dtype=dtype_int)
     obj_status = torch.zeros((N, 2), dtype=dtype_float)
@@ -30,9 +24,9 @@ def pack_spatial_data(
     kills_idx = torch.zeros((N, 2), dtype=dtype_int)
     trails_idx = torch.zeros((N, 10, 2), dtype=dtype_int)
 
-    all_kills: List[np.ndarray] = []
-    all_trails: List[np.ndarray] = []
-    labels: List = []
+    all_kills = []
+    all_trails = []
+    labels = []
     kills_offset = 0
     trails_offset = 0
 
@@ -106,19 +100,12 @@ def pack_spatial_data(
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input", type=str, default="combined_data/spatial_data_raw.pt")
-    parser.add_argument("--output", type=str, default="combined_data/spatial_data_packed.pt")
-    parser.add_argument("--dtype-float", type=str, choices=["float16", "float32"], default="float16")
-    parser.add_argument("--dtype-int", type=str, choices=["int32", "int64"], default="int32")
-    args = parser.parse_args()
+    input_path = Path("combined_data/spatial_data_raw.pt")
+    output_path = Path("combined_data/spatial_data_packed.pt")
+    dtype_float = torch.float16
+    dtype_int = torch.int32
 
-    input_path = Path(args.input)
-    output_path = Path(args.output)
-    dtype_float = torch.float16 if args.dtype_float == "float16" else torch.float32
-    dtype_int = torch.int32 if args.dtype_int == "int32" else torch.int64
-
-    spatial_data = torch.load(input_path, weights_only=False)
+    spatial_data = torch.load(input_path)
     pack_spatial_data(spatial_data, output_path, dtype_float=dtype_float, dtype_int=dtype_int)
 
 

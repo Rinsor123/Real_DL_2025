@@ -1,5 +1,7 @@
 """
 Hybrid Transformer-CNN Model for Objective Prediction
+
+we decided to go with scripts rather than notebooks for the main part as this was way easier to work with on LUMI
 """
 
 import argparse
@@ -32,11 +34,16 @@ def _hash_match_id(match_id: str) -> int:
     """
     convert matchId string to int32 hash 
     """
-    h = 5381
-    for char in match_id:
-        h = ((h << 5) + h) + ord(char)
-        h = h & 0xFFFFFFFF  
-    return h & 0x7FFFFFFF
+    return hash(match_id) & 0x7FFFFFFF
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    val = os.getenv(name, default)
+    return val is not None and val.lower() not in ("0", "false", "no", "")
+
+
+def _log(msg: str):
+    print(msg)
 
 
 USE_WANDB = _env_flag("USE_WANDB", "1")
@@ -47,8 +54,10 @@ WANDB_ENTITY = os.getenv("WANDB_ENTITY")
 #config
 DATA_ROOT = Path(os.getenv("DATA_ROOT", "/project/project_465002423/Deep-Learning-Project-2025/combined_data"))
 SPATIAL_PACKED_PATH = DATA_ROOT / "spatial_data_packed.pt"
+SPATIAL_DATA_PACKED_PATH = SPATIAL_PACKED_PATH
+TEAM_SEQUENCE_METADATA_PATH = DATA_ROOT / "team_sequence_metadata.json"
 SEQ_PATH = Path(os.getenv("TEAM_SEQUENCE_FEATURES_PATH", str(DATA_ROOT / "godview_cleaned.parquet")))
-if not SEQ_PATH.is_absolute(): SEQ_PATH = DATA_ROOT / SEQ_PATH
+
 
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
@@ -99,7 +108,7 @@ class TrainConfig:
 
     cnn_channels: int = 64
     cnn_dropout: float = 0.1
-    spatial_sigma: float = 1.5  # Spatial decay rate for heatmap blurring
+    spatial_sigma: float = 1.5  # spatial decay rate for heatmap blurring
 
     fusion_hidden_dim: int = 256
     fusion_dropout: float = 0.2
@@ -116,6 +125,7 @@ class TrainConfig:
 class SpatialInputLayer(nn.Module):
     """
     renders raw game state into multi-channel heatmap on GPU
+    works!!
     """
     def __init__(self, grid_size=GRID_SIZE, map_size=MAP_SIZE, sigma=1.5, turret_range=1100):
         super().__init__()
@@ -152,7 +162,7 @@ class SpatialInputLayer(nn.Module):
         return (coords / self.scale).long().clamp(0, self.grid_size - 1)
 
     def forward(self, player_trails, dead_towers_mask, kill_ctx, obj_status):
-        B = dead_towers_mask.shape[0]
+        B = dead_towers_mask.shape[0] #get back to this
         H, W = self.grid_size, self.grid_size
 
         canvas = torch.zeros(B, self.num_channels, H, W, device=dead_towers_mask.device)
@@ -230,6 +240,7 @@ class BasicResBlock(nn.Module):
 class SpatialCNN(nn.Module):
     """"
     ResNet-style CNN for spatial heatmap processing
+    allows tuning now
     """
     def __init__(self, base_channels=64, dropout=0.1, spatial_sigma=1.5):
         super().__init__()
@@ -286,6 +297,7 @@ class SpatialCNN(nn.Module):
 class TransformerEncoder(nn.Module):
     """
     transformer encoder for temporal team features
+    tuning also works!
     """
     def __init__(
         self,
@@ -371,7 +383,7 @@ class HybridModel(nn.Module):
             nn.Dropout(fusion_dropout),
         )
 
-        assert num_labels == 6, "Expected 6 labels: 3 horizons (1min, 2min, 3min) × 2 objectives (dragon, baron)"
+        assert num_labels == 6, "6 labels: 3 horizons (1min, 2min, 3min) × 2 objectives (dragon, baron)"
         self.head_1min = nn.Linear(fusion_hidden_dim // 2, 2)  # dragon_1min, baron_1min
         self.head_2min = nn.Linear(fusion_hidden_dim // 2, 2)  # dragon_2min, baron_2min
         self.head_3min = nn.Linear(fusion_hidden_dim // 2, 2)  # dragon_3min, baron_3min
@@ -392,12 +404,12 @@ class HybridModel(nn.Module):
         B, T, _ = sequence_features.shape
         device = sequence_features.device
 
-        transformer_out = self.transformer(sequence_features, src_key_padding_mask)  #(B, T, d_model)
+        transformer_out = self.transformer(sequence_features, src_key_padding_mask)  #(B, T, d_model) Er det rigtigt?
 
         if valid_lengths is None:
             valid_lengths = torch.full((B,), T, dtype=torch.long, device=device)
 
-        last_indices = (valid_lengths - 1).clamp(min=0)  #(B,)
+        last_indices = (valid_lengths - 1).clamp(min=0)  #(B,)  #many-to-one, use last valid timestep as summary
         batch_indices = torch.arange(B, device=device)
         transformer_last = transformer_out[batch_indices, last_indices]  #(B, d_model)
 
@@ -423,7 +435,7 @@ class HybridModel(nn.Module):
             logits_1min[:, 1:2],  #baron_1min
             logits_2min[:, 1:2],  #baron_2min
             logits_3min[:, 1:2],  #baron_3min
-        ], dim=-1)  #(B, 6)
+        ], dim=-1)  #(B, 6)  #many-to-one label order: dragon1/2/3, baron1/2/3
 
         return logits
 
@@ -448,6 +460,7 @@ class HybridBatch:
 class HybridDataset(Dataset):
     """
     dataset that provides both sequence features AND spatial data for the final frame
+    jacobs rod er væk...
     """
     def __init__(
         self,
@@ -460,31 +473,21 @@ class HybridDataset(Dataset):
         stride: int = 1,
         min_history: int = 1,
     ):
-        if isinstance(spatial_data, dict) and "meta" in spatial_data:
-            self.use_packed = True
-            self.packed_data = spatial_data
-            self.meta = spatial_data["meta"]  #[N, 2] 
-            self.obj_status = spatial_data["obj_status"]  #[N, 2]
-            self.towers = spatial_data["towers"]  # [N, 30] 
-            self.kills_val = spatial_data["kills_val"]  # [M, 4]
-            self.kills_idx = spatial_data["kills_idx"]  # [N, 2] 
-            self.trails_val = spatial_data["trails_val"]  # [P, 3]
-            self.trails_idx = spatial_data["trails_idx"]  # [N, 10, 2]
+        self.packed_data = spatial_data
+        self.meta = spatial_data["meta"]  #[N, 2] 
+        self.obj_status = spatial_data["obj_status"]  #[N, 2]
+        self.towers = spatial_data["towers"]  # [N, 30] 
+        self.kills_val = spatial_data["kills_val"]  # [M, 4]
+        self.kills_idx = spatial_data["kills_idx"]  # [N, 2] 
+        self.trails_val = spatial_data["trails_val"]  # [P, 3]
+        self.trails_idx = spatial_data["trails_idx"]  # [N, 10, 2]
 
-            meta_np = self.meta.numpy()
-            self.spatial_lookup = {}
-            for i in range(len(meta_np)):
-                match_hash = int(meta_np[i, 0])
-                minute = int(meta_np[i, 1])
-                self.spatial_lookup[(match_hash, minute)] = i
-
-            self._match_id_to_hash = {}  
-        else:
-            self.use_packed = False
-            self.spatial_lookup = {}
-            for state in spatial_data:
-                key = (state["matchId"], state["minute"])
-                self.spatial_lookup[key] = state
+        meta_np = self.meta.numpy()
+        self.spatial_lookup = {}
+        for i in range(len(meta_np)):
+            match_hash = int(meta_np[i, 0])
+            minute = int(meta_np[i, 1])
+            self.spatial_lookup[(match_hash, minute)] = i
 
         grouped = sequence_df.sort_values(["matchId", "teamId", "minute"])
         sequences = []
@@ -519,30 +522,18 @@ class HybridDataset(Dataset):
 
                 final_minute = int(chunk_minutes[-1])
 
-                if self.use_packed:
-                    match_hash = _hash_match_id(match_id)
-                    spatial_key = (match_hash, final_minute)
-                    if spatial_key in self.spatial_lookup:
-                        sequences.append({
-                            "seq": seq,
-                            "labels": lbl,
-                            "elig": elig_slice,
-                            "match_id": match_id,
-                            "match_hash": match_hash,
-                            "team_id": team_id,
-                            "final_minute": final_minute,
-                        })
-                else:
-                    spatial_key = (match_id, final_minute)
-                    if spatial_key in self.spatial_lookup:
-                        sequences.append({
-                            "seq": seq,
-                            "labels": lbl,
-                            "elig": elig_slice,
-                            "match_id": match_id,
-                            "team_id": team_id,
-                            "final_minute": final_minute,
-                        })
+                match_hash = _hash_match_id(match_id)
+                spatial_key = (match_hash, final_minute)
+                if spatial_key in self.spatial_lookup:
+                    sequences.append({
+                        "seq": seq,
+                        "labels": lbl,
+                        "elig": elig_slice,
+                        "match_id": match_id,
+                        "match_hash": match_hash,
+                        "team_id": team_id,
+                        "final_minute": final_minute,
+                    })
 
         self.sequences = sequences
         if requested_max_seq_len is None:
@@ -561,7 +552,7 @@ class HybridDataset(Dataset):
         seq, lbl, elig = item["seq"], item["labels"], item["elig"]
         valid_len = len(seq)
 
-        pad_len = max(self.max_seq_len - valid_len, 0)
+        pad_len = max(self.max_seq_len - valid_len, 0) #we need to pad the sequence to the max length
         if pad_len > 0:
             seq = np.pad(seq, ((0, pad_len), (0, 0)), mode="constant")
             lbl = np.pad(lbl, ((0, pad_len), (0, 0)), mode="constant")
@@ -574,15 +565,10 @@ class HybridDataset(Dataset):
 
         team_id = item["team_id"]
 
-        if self.use_packed:
-            match_hash = item.get("match_hash", _hash_match_id(item["match_id"]))
-            spatial_key = (match_hash, item["final_minute"])
-            spatial_idx = self.spatial_lookup[spatial_key]
-            spatial_dict = self._process_spatial_state_packed(spatial_idx, team_id)
-        else:
-            spatial_key = (item["match_id"], item["final_minute"])
-            spatial_state = self.spatial_lookup[spatial_key]
-            spatial_dict = self._process_spatial_state(spatial_state, team_id)
+        match_hash = item["match_hash"]
+        spatial_key = (match_hash, item["final_minute"])
+        spatial_idx = self.spatial_lookup[spatial_key]
+        spatial_dict = self._process_spatial_state_packed(spatial_idx, team_id)
 
         return {
             "sequence_inputs": torch.from_numpy(seq),
@@ -639,67 +625,17 @@ class HybridDataset(Dataset):
             "team_id": team_id,
         }
 
-    def _process_spatial_state(self, state: Dict, team_id: int) -> Dict:
-        """
-        process spatial state dict into tensors 
-        """
-        dead_towers = torch.zeros(30, dtype=torch.float32)
-        if state.get('dead_towers'):
-            dead_towers[torch.tensor(state['dead_towers'], dtype=torch.long)] = 1.0
-
-        obj_status = torch.tensor([
-            float(state['objectives']['dragon']),
-            float(state['objectives']['baron'])
-        ], dtype=torch.float32)
-
-        kills_data = state.get('kills', [])
-        if not kills_data:
-            kills = torch.empty((0, 4), dtype=torch.float32)
-        else:
-            kills = torch.tensor(kills_data, dtype=torch.float32)
-
-        p_coords_list = []
-        p_vals_list = []
-        p_channels_list = []
-
-        trails = state.get('player_trails', {})
-        for pid_str, points in trails.items():
-            pid = int(pid_str)
-            channel = pid - 1
-            for pt in points:
-                p_coords_list.append([pt[0], pt[1]])
-                p_vals_list.append(pt[2])
-                p_channels_list.append(channel)
-
-        if p_coords_list:
-            p_coords = torch.tensor(p_coords_list, dtype=torch.float32)
-            p_vals = torch.tensor(p_vals_list, dtype=torch.float32)
-            p_channels = torch.tensor(p_channels_list, dtype=torch.long)
-        else:
-            p_coords = torch.empty((0, 2), dtype=torch.float32)
-            p_vals = torch.empty((0,), dtype=torch.float32)
-            p_channels = torch.empty((0,), dtype=torch.long)
-
-        return {
-            "spatial_p_coords": p_coords,
-            "spatial_p_vals": p_vals,
-            "spatial_p_channels": p_channels,
-            "spatial_dead_towers": dead_towers,
-            "spatial_obj_status": obj_status,
-            "spatial_kills": kills,
-            "team_id": team_id,
-        }
-
 
 def collate_hybrid(batch):
     """
     custom collate function for hybrid dataset
+    is this correct?
     """
     sequence_inputs = torch.stack([item["sequence_inputs"] for item in batch])
     labels = torch.stack([item["labels"] for item in batch])
     eligibility = torch.stack([item["eligibility"] for item in batch])
     lengths = torch.tensor([item["valid_len"] for item in batch], dtype=torch.long)
-    mask = (torch.arange(sequence_inputs.shape[1]).unsqueeze(0) < lengths.unsqueeze(1)).float()
+    mask = (torch.arange(sequence_inputs.shape[1]).unsqueeze(0) < lengths.unsqueeze(1)).float()   #mask padding for transformer
 
     dead_towers = torch.stack([item["spatial_dead_towers"] for item in batch])
     obj_status = torch.stack([item["spatial_obj_status"] for item in batch])
@@ -833,6 +769,7 @@ def format_label_for_logging(label_name: str) -> str:
 def compute_horizon_avg_pr_auc(per_label_pr_auc: List[float]) -> Dict[str, float]:
     """
     compute average PR-AUC for each horizon (1min, 2min, 3min)
+    seems ok?
     """
     if len(per_label_pr_auc) != 6:
         return {
@@ -877,7 +814,8 @@ def compute_loss(logits: torch.Tensor, targets: torch.Tensor, valid_mask: torch.
 def evaluate_model(model: nn.Module, loader: DataLoader, pos_weight: torch.Tensor,
                    num_labels: int, device: torch.device, label_smoothing: float = 0.0) -> Dict:
     """
-    evaluate model with Many-to-One architecture
+    evaluate model with many-to-one architecture
+    doesnt seem to data leak anymore
     """
     model.eval()
     total_loss = 0.0
@@ -1025,23 +963,6 @@ if _fixed_bs_env:
 
 OPTUNA_STORAGE_PATH = SEARCH_OUTPUT_DIR / "optuna_study.db"
 
-def sample_random_config(rng: np.random.Generator) -> TrainConfig:
-    space = HYPERPARAM_SPACE
-    return TrainConfig(
-        d_model=int(rng.choice(space["d_model"])),
-        n_layers=int(rng.choice(space["n_layers"])),
-        transformer_dropout=float(rng.uniform(*space["transformer_dropout"])),
-        cnn_channels=int(rng.choice(space["cnn_channels"])),
-        fusion_hidden_dim=int(rng.choice(space["fusion_hidden_dim"])),
-        fusion_dropout=float(rng.uniform(*space["fusion_dropout"])),
-        spatial_sigma=float(rng.uniform(*space["spatial_sigma"])),
-        batch_size=int(rng.choice(space["batch_size"])),
-        lr=float(10 ** rng.uniform(np.log10(space["lr"][0]), np.log10(space["lr"][1]))),
-        weight_decay=float(10 ** rng.uniform(np.log10(space["weight_decay"][0]), np.log10(space["weight_decay"][1]))),
-        label_smoothing=float(rng.uniform(*space["label_smoothing"])),
-        seed=int(rng.integers(0, 10_000_000)),
-    )
-
 def sample_optuna_config(trial: "optuna.Trial", max_epochs: int = MAX_EPOCHS) -> TrainConfig:
     """
     sample hyperparameters using Optuna's Bayesian optimization
@@ -1064,20 +985,6 @@ def sample_optuna_config(trial: "optuna.Trial", max_epochs: int = MAX_EPOCHS) ->
 
         seed=trial.number * 1000 + RANDOM_SEED,
     )
-
-
-def generate_config_list(num_trials: int, rng_seed: int) -> List[Dict]:
-    """
-    sample a deterministic list of TrainConfig dictionaries for job arrays
-    """
-    rng = np.random.default_rng(rng_seed)
-    configs = []
-    for run_id in range(num_trials):
-        cfg = sample_random_config(rng)
-        cfg_dict = asdict(cfg)
-        cfg_dict["run_id"] = run_id
-        configs.append(cfg_dict)
-    return configs
 
 
 def resolve_max_seq_len(max_history_setting: str | int | None) -> int | None:
@@ -1131,10 +1038,6 @@ def train_single_config(
     val_ds = HybridDataset(val_df, spatial_data, feature_cols, label_cols, eligibility_cols, max_seq_len)
     test_ds = HybridDataset(test_df, spatial_data, feature_cols, label_cols, eligibility_cols, max_seq_len)
 
-    if len(train_ds) == 0 or len(val_ds) == 0:
-        _log(f"[Run {run_id}] Not enough data for training/validation. Skipping.")
-        return None
-
     max_seq_len_actual = max(train_ds.max_seq_len, val_ds.max_seq_len, test_ds.max_seq_len, MAX_SEQ_LEN)
 
     train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=shuffle, collate_fn=collate_hybrid, num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available())
@@ -1144,7 +1047,7 @@ def train_single_config(
     wandb_run = init_wandb_run(
         name=f"hybrid-run-{run_id:03d}",
         job_type="hyperparameter-search",
-        tags=["hybrid", "random-search"],
+        tags=["hybrid", "optuna-eval"],
         group=wandb_group,
         config={**asdict(config), "run_id": run_id, "feature_dim": len(feature_cols), "num_labels": len(label_cols)},
     )
@@ -1333,97 +1236,9 @@ def train_single_config(
     }
 
 
-def run_random_search(
-    num_trials: int,
-    rng_seed: int,
-    train_df: pd.DataFrame,
-    val_df: pd.DataFrame,
-    test_df: pd.DataFrame,
-    spatial_data: List[Dict],
-    feature_cols: List[str],
-    label_cols: List[str],
-    eligibility_cols: List[str],
-    pos_weight: torch.Tensor,
-    use_wandb_group: str | None = None,
-    shuffle: bool = True,
-):
-    rng = np.random.default_rng(rng_seed)
-    results = []
-    wandb_group = use_wandb_group or f"hybrid-search-seed-{rng_seed}"
-
-    search_run = init_wandb_run(
-        name=f"hybrid-search-summary-{rng_seed}",
-        job_type="hyperparameter-search-summary",
-        tags=["hybrid", "random-search", "summary"],
-        group=wandb_group,
-        config={"num_trials": num_trials, "rng_seed": rng_seed, "feature_dim": len(feature_cols)},
-    )
-
-    _log(f"Starting hybrid model random search over {num_trials} trials (seed={rng_seed})")
-
-    for run_id in range(1, num_trials + 1):
-        config = sample_random_config(rng)
-        _log(f"\n[Run {run_id:02d}] Config: lr={config.lr}, batch_size={config.batch_size}, "
-              f"d_model={config.d_model}, n_layers={config.n_layers}")
-
-        result = train_single_config(
-            run_id, config, train_df, val_df, test_df, spatial_data,
-            feature_cols, label_cols, eligibility_cols, pos_weight,
-            wandb_group=wandb_group, shuffle=shuffle
-        )
-
-        if result is None:
-            continue
-
-        results.append(result)
-        _log(
-            f"[Run {run_id:02d}] Val macro PR-AUC={result['val_macro_pr_auc']:.4f} | "
-            f"Test macro PR-AUC={result['test_macro_pr_auc']:.4f}"
-        )
-
-        if search_run:
-            search_run.log({
-                "trial/id": run_id,
-                "trial/val_macro_pr_auc": result["val_macro_pr_auc"],
-                "trial/test_macro_pr_auc": result["test_macro_pr_auc"],
-                "trial/val_macro_recall": result.get("val_macro_recall", float("nan")),
-                "trial/test_macro_recall": result.get("test_macro_recall", float("nan")),
-            }, step=run_id)
-
-    if not results:
-        _log("No successful runs.")
-        return []
-
-    results_sorted = sorted(results, key=lambda r: r["val_macro_pr_auc"], reverse=True)
-    best = results_sorted[0]
-    _log(
-        f"\nBest run: Run {best['run_id']:02d} with Val macro PR-AUC={best['val_macro_pr_auc']:.4f} "
-        f"and Test macro PR-AUC={best['test_macro_pr_auc']:.4f}"
-    )
-
-    if search_run:
-        val_recalls = np.array([r.get("val_macro_recall", float("nan")) for r in results_sorted], dtype=float)
-        search_run.log({
-            "search/best_run_id": best["run_id"],
-            "search/best_val_macro_pr_auc": best["val_macro_pr_auc"],
-            "search/best_test_macro_pr_auc": best["test_macro_pr_auc"],
-            "search/best_val_macro_recall": best.get("val_macro_recall", float("nan")),
-            "search/best_test_macro_recall": best.get("test_macro_recall", float("nan")),
-            "search/mean_val_macro_pr_auc": float(np.mean([r["val_macro_pr_auc"] for r in results_sorted])),
-            "search/std_val_macro_pr_auc": float(np.std([r["val_macro_pr_auc"] for r in results_sorted])),
-            "search/mean_val_macro_recall": float(np.nanmean(val_recalls)),
-            "search/std_val_macro_recall": float(np.nanstd(val_recalls)),
-        }, step=num_trials + 1)
-        search_run.finish()
-
-    return results_sorted
-
 # optuna search
 def create_optuna_study(study_name: str, storage_path: Path | None = None) -> "optuna.Study":
     """Create or load an Optuna study with SQLite storage for offline use."""
-    if not OPTUNA_AVAILABLE:
-        raise ImportError("Optuna is required for Bayesian search. Install with: pip install optuna")
-
     storage_path = storage_path or OPTUNA_STORAGE_PATH
     storage_url = f"sqlite:///{storage_path}?timeout=300"
 
@@ -1456,149 +1271,117 @@ def optuna_objective(
     """
     optuna objective function for a single trial
     """
-    wandb_run = None
-    try:
-        config = sample_optuna_config(trial, max_epochs=max_epochs)
-        set_global_seed(config.seed)
+    config = sample_optuna_config(trial, max_epochs=max_epochs)
+    set_global_seed(config.seed)
 
-        max_seq_len = resolve_max_seq_len(config.max_history_minutes)
+    max_seq_len = resolve_max_seq_len(config.max_history_minutes)
 
-        train_ds = HybridDataset(train_df, spatial_data, feature_cols, label_cols, eligibility_cols, max_seq_len)
-        val_ds = HybridDataset(val_df, spatial_data, feature_cols, label_cols, eligibility_cols, max_seq_len)
+    train_ds = HybridDataset(train_df, spatial_data, feature_cols, label_cols, eligibility_cols, max_seq_len)
+    val_ds = HybridDataset(val_df, spatial_data, feature_cols, label_cols, eligibility_cols, max_seq_len)
 
-        if len(train_ds) == 0 or len(val_ds) == 0:
-            return float("-inf")
+    max_seq_len_actual = max(train_ds.max_seq_len, val_ds.max_seq_len, MAX_SEQ_LEN)
 
-        max_seq_len_actual = max(train_ds.max_seq_len, val_ds.max_seq_len, MAX_SEQ_LEN)
+    train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=shuffle, collate_fn=collate_hybrid, num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available())
+    val_loader = DataLoader(val_ds, batch_size=config.batch_size, shuffle=False, collate_fn=collate_hybrid, num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available())
 
-        train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=shuffle, collate_fn=collate_hybrid, num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available())
-        val_loader = DataLoader(val_ds, batch_size=config.batch_size, shuffle=False, collate_fn=collate_hybrid, num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available())
+    wandb_run = init_wandb_run(
+        name=f"optuna-trial-{trial.number:03d}",
+        job_type="optuna-trial",
+        tags=["hybrid", "optuna", "bayesian"],
+        group=wandb_group,
+        config={**asdict(config), "trial_number": trial.number, "feature_dim": len(feature_cols)},
+    )
 
-        wandb_run = init_wandb_run(
-            name=f"optuna-trial-{trial.number:03d}",
-            job_type="optuna-trial",
-            tags=["hybrid", "optuna", "bayesian"],
-            group=wandb_group,
-            config={**asdict(config), "trial_number": trial.number, "feature_dim": len(feature_cols)},
-        )
+    model = create_model_for_config(config, len(feature_cols), max_seq_len_actual, num_labels=len(label_cols))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    total_steps = max(1, config.max_epochs * len(train_loader))
+    scheduler = create_scheduler(optimizer, total_steps)
 
-        model = create_model_for_config(config, len(feature_cols), max_seq_len_actual, num_labels=len(label_cols))
-        optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
-        total_steps = max(1, config.max_epochs * len(train_loader))
-        scheduler = create_scheduler(optimizer, total_steps)
+    best_val_metric = -float("inf")
+    best_val_metrics = None
+    patience_counter = 0
 
-        best_val_metric = -float("inf")
-        best_val_metrics = None
-        patience_counter = 0
+    for epoch in range(1, config.max_epochs + 1):
+        model.train()
+        epoch_losses = []
 
-        for epoch in range(1, config.max_epochs + 1):
-            model.train()
-            epoch_losses = []
+        for batch in train_loader:
+            seq_inputs = batch["sequence_inputs"].to(DEVICE)
+            labels_full = batch["labels"].to(DEVICE)
+            eligibility_full = batch["eligibility"].to(DEVICE)
+            mask = batch["mask"].to(DEVICE)
+            valid_lengths = batch["valid_lengths"].to(DEVICE)
 
-            for batch in train_loader:
-                seq_inputs = batch["sequence_inputs"].to(DEVICE)
-                labels_full = batch["labels"].to(DEVICE)
-                eligibility_full = batch["eligibility"].to(DEVICE)
-                mask = batch["mask"].to(DEVICE)
-                valid_lengths = batch["valid_lengths"].to(DEVICE)
+            spatial_data_batch = {
+                "player_trails": tuple(t.to(DEVICE) for t in batch["spatial_data"]["player_trails"]),
+                "dead_towers": batch["spatial_data"]["dead_towers"].to(DEVICE),
+                "obj_status": batch["spatial_data"]["obj_status"].to(DEVICE),
+                "kill_ctx": tuple(t.to(DEVICE) for t in batch["spatial_data"]["kill_ctx"]),
+            }
 
-                spatial_data_batch = {
-                    "player_trails": tuple(t.to(DEVICE) for t in batch["spatial_data"]["player_trails"]),
-                    "dead_towers": batch["spatial_data"]["dead_towers"].to(DEVICE),
-                    "obj_status": batch["spatial_data"]["obj_status"].to(DEVICE),
-                    "kill_ctx": tuple(t.to(DEVICE) for t in batch["spatial_data"]["kill_ctx"]),
-                }
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(seq_inputs, spatial_data_batch, src_key_padding_mask=(mask == 0), valid_lengths=valid_lengths)
 
-                optimizer.zero_grad(set_to_none=True)
-                logits = model(seq_inputs, spatial_data_batch, src_key_padding_mask=(mask == 0), valid_lengths=valid_lengths)
+            B = seq_inputs.shape[0]
+            last_indices = (valid_lengths - 1).clamp(min=0)
+            batch_indices = torch.arange(B, device=DEVICE)
+            labels = labels_full[batch_indices, last_indices]
+            eligibility = eligibility_full[batch_indices, last_indices]
 
-                B = seq_inputs.shape[0]
-                last_indices = (valid_lengths - 1).clamp(min=0)
-                batch_indices = torch.arange(B, device=DEVICE)
-                labels = labels_full[batch_indices, last_indices]
-                eligibility = eligibility_full[batch_indices, last_indices]
+            loss = compute_loss(logits, labels, eligibility, pos_weight, config.label_smoothing)
 
-                loss = compute_loss(logits, labels, eligibility, pos_weight, config.label_smoothing)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
+            epoch_losses.append(loss.item())
 
-                if torch.isnan(loss) or torch.isinf(loss):
-                    _log(f"WARNING: Trial {trial.number} encountered NaN/Inf loss at epoch {epoch}. Terminating trial.")
-                    if wandb_run:
-                        wandb_run.log({"error": "nan_loss", "error_epoch": epoch})
-                        wandb_run.finish(exit_code=1)
-                    return float("-inf")
-
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-                scheduler.step()
-                epoch_losses.append(loss.item())
-
-            val_metrics = evaluate_model(model, val_loader, pos_weight, len(label_cols), DEVICE, label_smoothing=config.label_smoothing)
-            metric = val_metrics["macro_pr_auc"]
-
-            if math.isnan(metric) or math.isinf(metric):
-                _log(f"WARNING: Trial {trial.number} produced NaN/Inf validation metric at epoch {epoch}. Terminating trial.")
-                if wandb_run:
-                    wandb_run.log({"error": "nan_metric", "error_epoch": epoch})
-                    wandb_run.finish(exit_code=1)
-                return float("-inf")
-
-            if wandb_run:
-                horizon_avgs = compute_horizon_avg_pr_auc(val_metrics["per_label_pr_auc"])
-                wandb_run.log({
-                    "epoch": epoch,
-                    "train/loss": float(np.mean(epoch_losses)),
-                    "val/loss": val_metrics["loss"],
-                    "val/macro_pr_auc": metric,
-                    "val/avg_pr_auc_1min": horizon_avgs["avg_pr_auc_1min"],
-                    "val/avg_pr_auc_2min": horizon_avgs["avg_pr_auc_2min"],
-                    "val/avg_pr_auc_3min": horizon_avgs["avg_pr_auc_3min"],
-                    "val/macro_precision": val_metrics["macro_precision"],
-                    "val/macro_recall": val_metrics["macro_recall"],
-                    "val/macro_accuracy": val_metrics["macro_accuracy"],
-                }, step=epoch)
-
-            trial.report(metric, epoch)
-
-            if trial.should_prune():
-                if wandb_run:
-                    wandb_run.log({"pruned": True, "pruned_at_epoch": epoch})
-                    wandb_run.finish()
-                raise optuna.TrialPruned()
-
-            if metric > best_val_metric + 1e-4:
-                best_val_metric = metric
-                best_val_metrics = val_metrics.copy()
-                patience_counter = 0
-            else:
-                patience_counter += 1
-                if patience_counter >= config.patience:
-                    break
+        val_metrics = evaluate_model(model, val_loader, pos_weight, len(label_cols), DEVICE, label_smoothing=config.label_smoothing)
+        metric = val_metrics["macro_pr_auc"]
 
         if wandb_run:
-            final_metrics = best_val_metrics if best_val_metrics is not None else val_metrics
+            horizon_avgs = compute_horizon_avg_pr_auc(val_metrics["per_label_pr_auc"])
             wandb_run.log({
-                "final/val_macro_pr_auc": best_val_metric,
-                "final/val_macro_precision": final_metrics.get("macro_precision", float("nan")),
-                "final/val_macro_recall": final_metrics.get("macro_recall", float("nan")),
-                "final/val_macro_accuracy": final_metrics.get("macro_accuracy", float("nan")),
-            })
-            wandb_run.finish()
+                "epoch": epoch,
+                "train/loss": float(np.mean(epoch_losses)),
+                "val/loss": val_metrics["loss"],
+                "val/macro_pr_auc": metric,
+                "val/avg_pr_auc_1min": horizon_avgs["avg_pr_auc_1min"],
+                "val/avg_pr_auc_2min": horizon_avgs["avg_pr_auc_2min"],
+                "val/avg_pr_auc_3min": horizon_avgs["avg_pr_auc_3min"],
+                "val/macro_precision": val_metrics["macro_precision"],
+                "val/macro_recall": val_metrics["macro_recall"],
+                "val/macro_accuracy": val_metrics["macro_accuracy"],
+            }, step=epoch)
 
-        return best_val_metric
+        trial.report(metric, epoch)
 
-    except optuna.TrialPruned:
-        if wandb_run:
-            wandb_run.finish()
-        raise
-    except Exception as e:
-        _log(f"ERROR: Trial {trial.number} failed with exception: {type(e).__name__}: {e}")
-        import traceback
-        traceback.print_exc()
-        if wandb_run:
-            wandb_run.log({"error": str(e), "error_type": type(e).__name__})
-            wandb_run.finish(exit_code=1)
-        return float("-inf")
+        if trial.should_prune():
+            if wandb_run:
+                wandb_run.log({"pruned": True, "pruned_at_epoch": epoch})
+                wandb_run.finish()
+            raise optuna.TrialPruned()
+
+        if metric > best_val_metric + 1e-4:
+            best_val_metric = metric
+            best_val_metrics = val_metrics.copy()
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= config.patience:
+                break
+
+    if wandb_run:
+        final_metrics = best_val_metrics if best_val_metrics is not None else val_metrics
+        wandb_run.log({
+            "final/val_macro_pr_auc": best_val_metric,
+            "final/val_macro_precision": final_metrics.get("macro_precision", float("nan")),
+            "final/val_macro_recall": final_metrics.get("macro_recall", float("nan")),
+            "final/val_macro_accuracy": final_metrics.get("macro_accuracy", float("nan")),
+        })
+        wandb_run.finish()
+
+    return best_val_metric
 
 def run_optuna_search(
     num_trials: int,
@@ -1620,13 +1403,6 @@ def run_optuna_search(
     """
     run Optuna Bayesian hyperparameter search
     """
-    if not OPTUNA_AVAILABLE:
-        raise ImportError(
-            "Optuna is required for Bayesian hyperparameter search. "
-            "Install with: pip install optuna\n"
-            "Falling back to random search is disabled to prevent accidental misconfiguration."
-        )
-
     study = create_optuna_study(study_name, storage_path)
     wandb_group = wandb_group or f"optuna-{study_name}"
 
@@ -1803,17 +1579,17 @@ def run_optuna_search(
 def main():
     parser_prelim = argparse.ArgumentParser(add_help=False)
     parser_prelim.add_argument("--mode", type=str, default="train",
-                               choices=["train", "search", "optuna", "evaluate", "trial"])
+                               choices=["train", "optuna", "evaluate", "trial"])
     args_prelim, _ = parser_prelim.parse_known_args()
 
-    if args_prelim.mode in ["optuna", "search"]:
+    if args_prelim.mode in ["optuna"]:
         jitter = random.uniform(0, 15)
         _log(f"Startup jitter: sleeping {jitter:.2f} seconds to prevent thundering herd")
         time.sleep(jitter)
 
-    parser = argparse.ArgumentParser(description="Hybrid Transformer-CNN Model Training")
+    parser = argparse.ArgumentParser(description="Hybrid Transformer-CNN Model Training", add_help=False)
     parser.add_argument("--mode", type=str, default="train",
-                       choices=["train", "search", "optuna", "evaluate", "trial"])
+                       choices=["train", "optuna", "evaluate", "trial"])
     parser.add_argument("--epochs", type=int, default=MAX_EPOCHS) 
     parser.add_argument("--trials", type=int, default=HYPERPARAM_SEARCH_TRIALS)
     parser.add_argument("--trial-id", type=int)
@@ -1825,7 +1601,6 @@ def main():
     parser.add_argument("--config-file", type=str) 
     parser.add_argument("--config-index", type=int) 
     parser.add_argument("--config-json", type=str) 
-    parser.add_argument("--dump-configs", type=str) 
     parser.add_argument("--run-id", type=int) 
     parser.add_argument("--wandb-group", type=str)
     parser.add_argument("--data-limit", type=int) 
@@ -1841,42 +1616,22 @@ def main():
         args.epochs = 50
         _log("[DEBUG MODE] Overriding settings: data_limit=10, epochs=50, shuffle=False, early_stopping=disabled")
 
-    if args.dump_configs:
-        config_output = generate_config_list(args.trials, args.seed)
-        dump_path = Path(args.dump_configs)
-        dump_path.parent.mkdir(parents=True, exist_ok=True)
-        with dump_path.open("w") as fp:
-            json.dump(config_output, fp, indent=2)
-        _log(f"Wrote {len(config_output)} configs to {dump_path}")
-        return
-
     _log("Loading data...")
 
-    if SPATIAL_DATA_PACKED_PATH.exists():
-        _log(f"Loading packed spatial data from {SPATIAL_DATA_PACKED_PATH}...")
-        spatial_data = torch.load(SPATIAL_DATA_PACKED_PATH, weights_only=False)
-        _log(f"Loaded packed format with {spatial_data.get('num_samples', 'unknown')} samples")
-    elif SPATIAL_DATA_PATH.exists():
-        _log(f"Loading raw spatial data from {SPATIAL_DATA_PATH}")
-        _log("Note: Consider converting to packed format using pack_spatial.py for better memory efficiency")
-        spatial_data = torch.load(SPATIAL_DATA_PATH, weights_only=False)
-    else:
-        _log(f"Error: Spatial data not found at {SPATIAL_DATA_PATH} or {SPATIAL_DATA_PACKED_PATH}")
-        _log("Please run 'python preprocess_all.py' first, or convert to packed format with 'python pack_spatial.py'")
-        return
+    spatial_data = torch.load(SPATIAL_DATA_PACKED_PATH, weights_only=False)
 
     _log("Loading sequence data from godview_cleaned.parquet...")
     team_sequence_df = pd.read_parquet("godview_cleaned.parquet")
 
-    # Optional: Keep the data limit logic if you still want to use --data-limit
+   
     if args.data_limit:
-    match_ids = team_sequence_df["matchId"].unique()[:args.data_limit]
-    team_sequence_df = team_sequence_df[team_sequence_df["matchId"].isin(match_ids)]
-    _log(f"Limited to {args.data_limit} games.")    
+        match_ids = team_sequence_df["matchId"].unique()[:args.data_limit]
+        team_sequence_df = team_sequence_df[team_sequence_df["matchId"].isin(match_ids)]
+        _log(f"Limited to {args.data_limit} games.")
 
-        _log(f"Filling NaN values from schema drift (shape before: {team_sequence_df.shape})...")
-        team_sequence_df = team_sequence_df.fillna(0)
-        _log(f"Shape after fillna: {team_sequence_df.shape}")
+    _log(f"Filling NaN values from schema drift (shape before: {team_sequence_df.shape})...")
+    team_sequence_df = team_sequence_df.fillna(0)
+    _log(f"Shape after fillna: {team_sequence_df.shape}")
 
     with open(TEAM_SEQUENCE_METADATA_PATH, "r") as meta_file:
         team_sequence_meta = json.load(meta_file)
@@ -1885,78 +1640,51 @@ def main():
     team_eligibility_cols = team_sequence_meta.get("team_eligibility_cols", [])
     team_sequence_feature_cols = team_sequence_meta["team_sequence_feature_cols"]
 
-    EXPECTED_LABEL_ORDER = [
-        "dragon_taken_next_1min",
-        "dragon_taken_next_2min",
-        "dragon_taken_next_3min",
-        "baron_taken_next_1min",
-        "baron_taken_next_2min",
-        "baron_taken_next_3min",
-    ]
-    if team_label_cols != EXPECTED_LABEL_ORDER:
-        raise ValueError(
-            f"Label order mismatch! This will cause logits[i] to correspond to wrong label.\n"
-            f"Expected order (from HybridModel.forward): {EXPECTED_LABEL_ORDER}\n"
-            f"Actual order (from metadata): {team_label_cols}\n"
-            f"Either fix the metadata preprocessing to match this order, or update HybridModel.forward's "
-            f"concatenation logic to match the actual label order."
-        )
+    num_spatial_samples = spatial_data.get("num_samples", len(spatial_data["meta"]))
+    _log(f"Loaded {num_spatial_samples:,} spatial samples (packed format), {len(team_sequence_df):,} sequence rows")
 
-    if isinstance(spatial_data, dict) and "meta" in spatial_data:
-        num_spatial_samples = spatial_data.get("num_samples", len(spatial_data["meta"]))
-        _log(f"Loaded {num_spatial_samples:,} spatial samples (packed format), {len(team_sequence_df):,} sequence rows")
+    if args.data_limit:
+        match_ids = team_sequence_df["matchId"].unique()[:args.data_limit]
+        team_sequence_df = team_sequence_df[team_sequence_df["matchId"].isin(match_ids)]
 
-        if args.data_limit:
-            match_ids = team_sequence_df["matchId"].unique()[:args.data_limit]
-            team_sequence_df = team_sequence_df[team_sequence_df["matchId"].isin(match_ids)]
+        def normalize_match_id(mid):
+            mid_str = str(mid)
+            if mid_str.endswith('.0'):
+                mid_str = mid_str[:-2]
+            return mid_str
 
-            def normalize_match_id(mid):
-                mid_str = str(mid)
-                if mid_str.endswith('.0'):
-                    mid_str = mid_str[:-2]
-                return mid_str
+        match_hashes = {_hash_match_id(normalize_match_id(mid)) for mid in match_ids}
+        meta_np = spatial_data["meta"].numpy()
+        valid_indices = []
+        for i in range(len(meta_np)):
+            if int(meta_np[i, 0]) in match_hashes:
+                valid_indices.append(i)
 
-            match_hashes = {_hash_match_id(normalize_match_id(mid)) for mid in match_ids}
+        if len(valid_indices) < len(meta_np):
+            _log(f"Filtering packed data to {len(valid_indices):,} samples...")
+            valid_indices = np.array(valid_indices)
+            spatial_data = {
+                "meta": spatial_data["meta"][valid_indices],
+                "obj_status": spatial_data["obj_status"][valid_indices],
+                "towers": spatial_data["towers"][valid_indices],
+                "kills_idx": spatial_data["kills_idx"][valid_indices],
+                "trails_idx": spatial_data["trails_idx"][valid_indices],
+                "kills_val": spatial_data["kills_val"],  # keep all kills, update indices
+                "trails_val": spatial_data["trails_val"],  # keep all trails, update indices
+                "num_samples": len(valid_indices),
+            }
             meta_np = spatial_data["meta"].numpy()
-            valid_indices = []
+            spatial_lookup = {}
             for i in range(len(meta_np)):
-                if int(meta_np[i, 0]) in match_hashes:
-                    valid_indices.append(i)
+                match_hash = int(meta_np[i, 0])
+                minute = int(meta_np[i, 1])
+                spatial_lookup[(match_hash, minute)] = i
+            spatial_data["spatial_lookup"] = spatial_lookup
 
-            if len(valid_indices) < len(meta_np):
-                _log(f"Filtering packed data to {len(valid_indices):,} samples...")
-                valid_indices = np.array(valid_indices)
-                spatial_data = {
-                    "meta": spatial_data["meta"][valid_indices],
-                    "obj_status": spatial_data["obj_status"][valid_indices],
-                    "towers": spatial_data["towers"][valid_indices],
-                    "kills_idx": spatial_data["kills_idx"][valid_indices],
-                    "trails_idx": spatial_data["trails_idx"][valid_indices],
-                    "kills_val": spatial_data["kills_val"],  # Keep all kills, update indices
-                    "trails_val": spatial_data["trails_val"],  # Keep all trails, update indices
-                    "num_samples": len(valid_indices),
-                }
-                meta_np = spatial_data["meta"].numpy()
-                spatial_lookup = {}
-                for i in range(len(meta_np)):
-                    match_hash = int(meta_np[i, 0])
-                    minute = int(meta_np[i, 1])
-                    spatial_lookup[(match_hash, minute)] = i
-                spatial_data["spatial_lookup"] = spatial_lookup
-
-            _log(f"Limited to {args.data_limit} games: {len(team_sequence_df):,} rows, {len(valid_indices):,} spatial samples")
-    else:
-        _log(f"Loaded {len(spatial_data):,} spatial samples (legacy format), {len(team_sequence_df):,} sequence rows")
-
-        if args.data_limit:
-            match_ids = team_sequence_df["matchId"].unique()[:args.data_limit]
-            team_sequence_df = team_sequence_df[team_sequence_df["matchId"].isin(match_ids)]
-            spatial_data = [s for s in spatial_data if s["matchId"] in match_ids]
-            _log(f"Limited to {args.data_limit} games: {len(team_sequence_df):,} rows, {len(spatial_data):,} spatial samples")
-
+        _log(f"Limited to {args.data_limit} games: {len(team_sequence_df):,} rows, {len(valid_indices):,} spatial samples")
     _log(f"Features: {len(team_sequence_feature_cols)}, Labels: {team_label_cols}")
 
-    _log("Splitting data...")
+    _log("splitting data...")
     match_ids = team_sequence_df["matchId"].unique()
     train_matches, holdout_matches = train_test_split(
         match_ids, test_size=VAL_SPLIT + TEST_SPLIT, random_state=RANDOM_SEED, shuffle=True
@@ -1970,7 +1698,7 @@ def main():
     val_df = team_sequence_df[team_sequence_df["matchId"].isin(val_matches)].reset_index(drop=True)
     test_df = team_sequence_df[team_sequence_df["matchId"].isin(test_matches)].reset_index(drop=True)
 
-    _log("Normalizing features...")
+    _log("normalizing features...")
     continuous_cols = _detect_continuous_features(team_sequence_df, team_sequence_feature_cols)
     norm_stats = _compute_normalization_stats(train_df, continuous_cols)
     train_df = _apply_normalization(train_df, norm_stats)
@@ -2013,32 +1741,6 @@ def main():
             trial_id=args.trial_id,
             shuffle=shuffle,
         )
-        return
-
-    if args.mode == "search":
-        if args.trial_id is not None:
-            _log(f"Starting single trial {args.trial_id} (seed={args.seed})")
-            rng = np.random.default_rng(args.seed)
-            config = None
-            for _ in range(args.trial_id):
-                config = sample_random_config(rng)
-            if config is None:
-                raise ValueError(f"Failed to sample config for trial {args.trial_id}")
-
-            wandb_group = args.wandb_group or f"hybrid-search-seed-{args.seed}"
-            result = train_single_config(
-                args.trial_id, config, train_df, val_df, test_df, spatial_data,
-                team_sequence_feature_cols, team_label_cols, team_eligibility_cols, pos_weight,
-                wandb_group=wandb_group, shuffle=shuffle
-            )
-            if result:
-                _log(f"[Trial {args.trial_id:02d}] Val PR-AUC={result['val_macro_pr_auc']:.4f}")
-        else:
-            run_random_search(
-                args.trials, args.seed, train_df, val_df, test_df, spatial_data,
-                team_sequence_feature_cols, team_label_cols, team_eligibility_cols, pos_weight,
-                use_wandb_group=args.wandb_group, shuffle=shuffle
-            )
         return
 
     if args.mode == "trial":
