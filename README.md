@@ -1,9 +1,9 @@
 # README
 # Taming the Dragon: Predicting Epic Monster Kills in LoL
 
-This repository contains the implementation for the paper "Taming the Dragon: Predicting Epic Monster Deaths in League of Legends". 
+This repository contains the implementation for the paper "Taming the Dragon: Predicting Epic Monster Kills in League of Legends". 
 
-It features a Hybrid Multi-Modal Transformer-CNN model that fuses temporal game state data (gold, XP curves) with spatial map data (champion positions, vision) to predict Dragon and Baron kills 1, 2, and 3 minutes into the future.
+It features a Hybrid Multi-Modal Transformer-CNN model that fuses temporal game state data with spatial map data to predict dragon and baron kills 1, 2, and 3 minutes into the future.
 This folder contains all of the python scripts used for our projects each of these scripts have a use in the pipeline of creating the model.
 
 ### Scripts
@@ -18,11 +18,11 @@ This folder contains scripts for four different stages of the pipeline.
     This file preprocesses all the data. This includes feature engineering and applying labels to observations.
 
     > pack\_spatial.py<br>
-    Packs raw spatial dictionaries into dense tensors to reduce RAM and speed downstream training.
+    Packs raw spatial dictionaries into dense tensors to reduce RAM.
 
 3. Files used for training baseline models.
     > xgboost-godview_final.ipynb<br>
-    This file is used for training an xgboost model in order for us to compare performance.
+    This file is used for training an xgboost model in order for us to compare performance. It also contains a bit of preprocessing.
 
     > spatial\_only\_model.py<br>
     This file is used for training a model entirely dependent on the spatial data created.
