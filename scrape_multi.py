@@ -3,6 +3,8 @@
 Multi-region Challenger scraper for the 2025 season.
 
 target multiple routing pairs for faster scraping - api limits are per region
+
+GAI has helped quite a bit with this script, due to the complex logic and minor relevance for the course. We didn't simply copy-paste, but we got help.
 """
 
 import argparse
